@@ -1,0 +1,8 @@
+selenium>=4.20,<5
+requests>=2.31,<3
+pypdf>=4.2,<7
+openpyxl>=3.1,<4
+PyMuPDF>=1.24,<2
+Pillow>=10.3,<13
+pytesseract>=0.3.10,<1
+PyQt6>=6.7,<7

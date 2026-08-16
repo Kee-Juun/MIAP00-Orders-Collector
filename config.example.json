@@ -1,0 +1,20 @@
+{
+  "source_url": "https://www.courts.michigan.gov/case-search/",
+  "output_root": "Downloads/MIAP00 Orders Collections",
+  "irt_url": "https://tcfabprod.lexisnexis.com/shared/InventoryInvoicing/",
+  "irt_court_code": "STMIAP00",
+  "headless": true,
+  "browser_timeout_seconds": 60,
+  "irt_timeout_seconds": 120,
+  "download_timeout_seconds": 90,
+  "request_delay_seconds": 1.0,
+  "page_size": 100,
+  "sort_order": "Newest",
+  "start_date": "",
+  "end_date": "",
+  "default_days_back": 7,
+  "max_pages": 0,
+  "fail_closed_on_irt_error": true,
+  "require_nonempty_irt_index": true,
+  "chromedriver_path": ""
+}
