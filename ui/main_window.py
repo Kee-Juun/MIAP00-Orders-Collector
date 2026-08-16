@@ -89,17 +89,36 @@ def set_startup_topmost(widget: QWidget, enabled: bool) -> None:
     if sys.platform == "win32" and widget.isVisible():
         try:
             import ctypes
+            from ctypes import wintypes
 
-            insert_after = -1 if enabled else -2  # HWND_TOPMOST / HWND_NOTOPMOST
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.SetWindowPos.argtypes = (
+                wintypes.HWND,
+                wintypes.HWND,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            )
+            user32.SetWindowPos.restype = wintypes.BOOL
+            user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+            user32.SetForegroundWindow.restype = wintypes.BOOL
+
+            insert_after = wintypes.HWND(
+                -1 if enabled else -2
+            )  # HWND_TOPMOST / HWND_NOTOPMOST
             flags = 0x0001 | 0x0002 | 0x0040  # NOSIZE | NOMOVE | SHOWWINDOW
             if not enabled:
                 flags |= 0x0010  # Do not steal focus when releasing topmost.
-            ctypes.windll.user32.SetWindowPos(
-                int(widget.winId()), insert_after, 0, 0, 0, 0, flags
+            hwnd = wintypes.HWND(int(widget.winId()))
+            positioned = user32.SetWindowPos(
+                hwnd, insert_after, 0, 0, 0, 0, flags
             )
-            if enabled:
-                ctypes.windll.user32.SetForegroundWindow(int(widget.winId()))
-            return
+            if positioned:
+                if enabled:
+                    user32.SetForegroundWindow(hwnd)
+                return
         except (AttributeError, OSError):
             pass
 
@@ -1070,7 +1089,15 @@ def launch(settings: Settings) -> None:
 
             def finish_startup_handoff() -> None:
                 window.intro_paper.hide()
-                set_startup_topmost(window, False)
+                # Keep the completed window above other applications long enough
+                # for the native compositor to present the final, fully opaque
+                # frame. Releasing topmost in the animation's finished callback
+                # can otherwise demote the window during that final presentation.
+                window.raise_()
+                window.activateWindow()
+                QTimer.singleShot(
+                    750, lambda: set_startup_topmost(window, False)
+                )
 
             surface_transition.finished.connect(finish_startup_handoff)
             surface_transition.start(
