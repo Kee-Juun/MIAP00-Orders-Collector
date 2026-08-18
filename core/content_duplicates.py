@@ -20,6 +20,8 @@ _DOCKET_REFERENCE_PATTERN = re.compile(
 )
 _SPACE_PATTERN = re.compile(r"\s+")
 _CONSOLIDATED_SIMILARITY = 0.97
+_EXPLICIT_CONSOLIDATED_SIMILARITY = 0.88
+_COA_DOCKET_PATTERN = re.compile(r"\bCOA\s*#?\s*(\d{5,7})\b", re.IGNORECASE)
 
 
 @dataclass
@@ -32,34 +34,37 @@ class _Profile:
     text_digest: str
     visual_digest: str
     dockets: set[str]
+    explicit_consolidation: bool
 
 
 @dataclass(frozen=True)
-class IRTBackedConsolidatedMatch:
+class IRTBackedContentMatch:
     parent_filename: str
     shared_dockets: tuple[str, ...]
     similarity: float
     irt_evidence: list[dict]
+    match_kind: str
+    method: str
 
 
-def find_irt_backed_consolidated_duplicates(
+def find_irt_backed_content_duplicates(
     candidates: list[tuple[ProcessingRecord, Path]],
     exact_irt_matches: dict[str, list[dict]],
     logger,
     cancel_event=None,
-) -> dict[str, IRTBackedConsolidatedMatch]:
-    """Match pending consolidated copies to a PDF already represented in IRT.
+) -> dict[str, IRTBackedContentMatch]:
+    """Match pending content copies to a PDF already represented in IRT.
 
     The exact IRT match supplies the online-parent evidence. Both temporary PDFs
-    must also share consolidated appellate docket numbers and have at least 97%
-    normalized content similarity. This prevents a mere docket mention from
-    excluding a distinct order.
+    are still available at this point, allowing an exact same-docket content
+    comparison before the IRT parent is discarded. Consolidated matches retain
+    their stricter multi-docket similarity rules.
     """
 
     if len(candidates) < 2 or not exact_irt_matches:
         return {}
     logger.info(
-        "IRT-backed consolidated check: comparing %d renamed PDF(s)",
+        "IRT-backed content check: comparing %d renamed PDF(s)",
         len(candidates),
     )
     profiles = []
@@ -75,7 +80,7 @@ def find_irt_backed_consolidated_duplicates(
         for profile in profiles
         if exact_irt_matches.get(profile.record.target_filename)
     ]
-    matches: dict[str, IRTBackedConsolidatedMatch] = {}
+    matches: dict[str, IRTBackedContentMatch] = {}
     for profile in profiles:
         raise_if_cancelled(cancel_event)
         filename = profile.record.target_filename
@@ -83,17 +88,40 @@ def find_irt_backed_consolidated_duplicates(
             continue
         for parent in parents:
             raise_if_cancelled(cancel_event)
+            same_docket = _same_docket_content_match(parent, profile)
+            if same_docket:
+                method, similarity = same_docket
+                matches[filename] = IRTBackedContentMatch(
+                    parent_filename=parent.record.target_filename,
+                    shared_dockets=tuple(sorted(parent.dockets & profile.dockets)),
+                    similarity=similarity,
+                    irt_evidence=list(
+                        exact_irt_matches[parent.record.target_filename]
+                    ),
+                    match_kind="same_docket",
+                    method=method,
+                )
+                logger.info(
+                    "IRT-backed same-docket content duplicate found: %s "
+                    "(online parent %s; %s)",
+                    filename,
+                    parent.record.target_filename,
+                    method,
+                )
+                break
             similarity = _consolidated_similarity(parent, profile)
             if similarity is None:
                 continue
             shared = tuple(sorted(parent.dockets & profile.dockets))
-            matches[filename] = IRTBackedConsolidatedMatch(
+            matches[filename] = IRTBackedContentMatch(
                 parent_filename=parent.record.target_filename,
                 shared_dockets=shared,
                 similarity=similarity,
                 irt_evidence=list(
                     exact_irt_matches[parent.record.target_filename]
                 ),
+                match_kind="consolidated",
+                method="normalized consolidated-case content similarity",
             )
             logger.info(
                 "IRT-backed consolidated copy found: %s (online parent %s; "
@@ -107,6 +135,10 @@ def find_irt_backed_consolidated_duplicates(
     return matches
 
 
+# Compatibility for integrations importing the earlier public helper name.
+find_irt_backed_consolidated_duplicates = find_irt_backed_content_duplicates
+
+
 def remove_content_duplicates(
     records: list[ProcessingRecord], run_dir: Path, logger, cancel_event=None
 ) -> int:
@@ -118,7 +150,7 @@ def remove_content_duplicates(
     """
 
     candidates = [record for record in records if record.status == "collected"]
-    if len(candidates) < 2:
+    if not candidates:
         return 0
 
     logger.info(
@@ -139,6 +171,9 @@ def remove_content_duplicates(
             )
             continue
         profiles.append(_build_profile(record, path, logger, cancel_event))
+
+    if len(profiles) < 2:
+        return 0
 
     kept: list[_Profile] = []
     exact_binary: dict[str, _Profile] = {}
@@ -173,6 +208,11 @@ def remove_content_duplicates(
                     break
 
         if match:
+            related_dockets = sorted(match.dockets | profile.dockets)
+            match.dockets.update(profile.dockets)
+            match.record.related_dockets = related_dockets
+            profile.record.related_dockets = related_dockets
+            profile.record.duplicate_parent_filename = match.record.target_filename
             try:
                 profile.path.unlink()
             except OSError as exc:
@@ -218,6 +258,7 @@ def _build_profile(record: ProcessingRecord, path: Path, logger, cancel_event=No
     )
     text = _normalize_text(raw_text)
     dockets = _extract_dockets(text, record.docket)
+    record.related_dockets = sorted(dockets)
     comparable = text
     for docket in sorted(dockets, key=len, reverse=True):
         comparable = re.sub(rf"\b{re.escape(docket)}\b", "<docket>", comparable)
@@ -236,10 +277,11 @@ def _build_profile(record: ProcessingRecord, path: Path, logger, cancel_event=No
         path=path,
         text=text,
         comparable_text=comparable,
-        binary_digest=record.sha256,
+        binary_digest=record.sha256 or _file_digest(path, cancel_event),
         text_digest=text_digest,
         visual_digest=visual_digest,
         dockets=dockets,
+        explicit_consolidation="consolidat" in text,
     )
 
 
@@ -272,7 +314,36 @@ def _consolidated_similarity(left: _Profile, right: _Profile) -> float | None:
     ratio = SequenceMatcher(
         None, left.comparable_text, right.comparable_text, autojunk=False
     ).ratio()
-    return ratio if ratio >= _CONSOLIDATED_SIMILARITY else None
+    reciprocal_explicit_consolidation = (
+        left.explicit_consolidation
+        and right.explicit_consolidation
+        and left.record.docket in right.dockets
+        and right.record.docket in left.dockets
+    )
+    threshold = (
+        _EXPLICIT_CONSOLIDATED_SIMILARITY
+        if reciprocal_explicit_consolidation
+        else _CONSOLIDATED_SIMILARITY
+    )
+    return ratio if ratio >= threshold else None
+
+
+def _same_docket_content_match(
+    left: _Profile, right: _Profile
+) -> tuple[str, float] | None:
+    """Confirm an IRT-backed suffix copy without merging distinct case orders."""
+
+    if not left.record.docket or left.record.docket != right.record.docket:
+        return None
+    if left.record.document_date != right.record.document_date:
+        return None
+    if left.binary_digest and left.binary_digest == right.binary_digest:
+        return "identical PDF bytes", 1.0
+    if left.text_digest and left.text_digest == right.text_digest:
+        return "identical normalized PDF text", 1.0
+    if left.visual_digest and left.visual_digest == right.visual_digest:
+        return "identical rendered PDF content", 1.0
+    return None
 
 
 def _normalize_text(text: str) -> str:
@@ -283,6 +354,7 @@ def _extract_dockets(text: str, primary_docket: str) -> set[str]:
     dockets = {primary_docket} if primary_docket else set()
     for match in _DOCKET_REFERENCE_PATTERN.finditer(text):
         dockets.update(_DOCKET_NUMBER_PATTERN.findall(match.group("numbers")))
+    dockets.update(_COA_DOCKET_PATTERN.findall(text))
     return dockets
 
 
@@ -327,3 +399,17 @@ def _rendered_pdf_digest(path: Path, logger, cancel_event=None) -> str:
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _file_digest(path: Path, cancel_event=None) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                raise_if_cancelled(cancel_event)
+                digest.update(chunk)
+        return digest.hexdigest()
+    except CollectionCancelled:
+        raise
+    except OSError:
+        return ""

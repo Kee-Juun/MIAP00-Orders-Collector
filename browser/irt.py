@@ -34,6 +34,7 @@ class IRTDuplicateChecker:
     DATE_FROM_ID = "receivedDateandTimeSearchFrom"
     DATE_TO_ID = "receivedDateandTimeSearchTo"
     COURT_ID = "courtSearch"
+    DOCKET_ID = "docketNumberSearch"
     FILE_NAME_ID = "originalFileNameSearch"
     SEARCH_ID = "search"
     TABLE_ID = "searchTable"
@@ -134,6 +135,7 @@ class IRTDuplicateChecker:
         self.bulk_load_success = False
         raise_if_cancelled(self.cancel_event)
         self.initialize()
+        self._set_field(self.DOCKET_ID, "")
         self._set_field(self.FILE_NAME_ID, "")
         self._set_field(self.COURT_ID, self.settings.irt_court_code)
         self._set_date_field(self.DATE_FROM_ID, start_date.strftime("%m-%d-%Y"))
@@ -199,6 +201,82 @@ class IRTDuplicateChecker:
     ) -> list[dict[str, Any]]:
         key = normalize_final_key(target_filename)
         return list(existing.get(key, [])) if key else []
+
+    def find_existing_counsel(
+        self,
+        docket: str,
+        start_date: date,
+        end_date: date,
+    ) -> list[dict[str, Any]]:
+        """Return every matching counsel inventory row for one appellate docket."""
+
+        raise_if_cancelled(self.cancel_event)
+        self.initialize()
+        pattern = f"*{docket}*counsel*"
+        self._set_field(self.COURT_ID, self.settings.irt_court_code)
+        self._set_field(self.DOCKET_ID, docket)
+        self._set_field(self.FILE_NAME_ID, pattern)
+        self._set_date_field(self.DATE_FROM_ID, start_date.strftime("%m-%d-%Y"))
+        self._set_date_field(self.DATE_TO_ID, end_date.strftime("%m-%d-%Y"))
+        self.logger.info(
+            "IRT counsel duplicate check: court=%s docket=%s filename=%s",
+            self.settings.irt_court_code,
+            docket,
+            pattern,
+        )
+        self._search()
+        records = self._capture_current_results(
+            context=f"counsel duplicate search for docket {docket}"
+        )
+        docket_key = docket.casefold()
+        matches = [
+            record
+            for record in records
+            if docket_key in str(record.get("File Name", "")).casefold()
+            and "counsel" in str(record.get("File Name", "")).casefold()
+        ]
+        self.logger.info(
+            "IRT counsel duplicate result for %s: %d matching record(s)",
+            docket,
+            len(matches),
+        )
+        return matches
+
+    def _capture_current_results(self, *, context: str) -> list[dict[str, Any]]:
+        """Capture every page from the current IRT search and verify completeness."""
+
+        expected_count = self._result_count()
+        captured: list[dict[str, Any]] = []
+        seen_pages: set[tuple[str, ...]] = set()
+        page = 1
+        while True:
+            raise_if_cancelled(
+                self.cancel_event,
+                f"Collection stopped while capturing IRT {context}",
+            )
+            records = self._records()
+            signature = tuple(record.get("File Name", "") for record in records)
+            if signature in seen_pages:
+                raise IRTError(
+                    f"IRT pagination repeated a page during {context}"
+                )
+            seen_pages.add(signature)
+            captured.extend(records)
+            self.logger.info(
+                "IRT %s results page %d: %d record(s)",
+                context,
+                page,
+                len(records),
+            )
+            if not self._next_page():
+                break
+            page += 1
+        if expected_count is not None and len(captured) < expected_count:
+            raise IRTError(
+                f"IRT {context} was incomplete: captured {len(captured)} of "
+                f"{expected_count} displayed record(s)"
+            )
+        return captured
 
     def _set_field(self, element_id: str, value: str) -> None:
         field = self._wait(

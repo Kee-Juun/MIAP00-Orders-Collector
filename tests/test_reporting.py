@@ -28,6 +28,10 @@ class ReportingTests(unittest.TestCase):
                 source_filename="source-1.pdf",
                 source_url="",
                 target_filename="LDC_SMD_1_08142026.pdf",
+                counsel_references=[
+                    "1: LDC_SMD_1counsel.html",
+                    "10: 123456789",
+                ],
             ),
             ProcessingRecord(
                 status="duplicate",
@@ -62,13 +66,21 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(
             [cell.value for cell in sheet["A"]],
             [
-                "Filename",
+                "Main Document Filename",
                 "LDC_SMD_1_08142026.pdf",
                 "LDC_SMD_3_08142026.pdf",
             ],
         )
+        self.assertEqual(
+            [cell.value for cell in sheet["B"]],
+            [
+                "Counsel Filename / Recycled LNI",
+                "1: LDC_SMD_1counsel.html\n10: 123456789",
+                "",
+            ],
+        )
         self.assertEqual(sheet.freeze_panes, "A2")
-        self.assertEqual(sheet.auto_filter.ref, "A1:A3")
+        self.assertEqual(sheet.auto_filter.ref, "A1:B3")
 
 
 if __name__ == "__main__":

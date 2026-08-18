@@ -180,5 +180,32 @@ class IRTResilienceTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "captured 1 of 2"):
                 self.checker.load_existing(date(2026, 8, 12), date(2026, 8, 14))
 
+    def test_counsel_lookup_uses_court_docket_pattern_and_all_result_pages(self):
+        first = {"File Name": "LDC_SMD_380275counsel.html", "LNI": "111"}
+        unrelated = {"File Name": "LDC_SMD_999999counsel.html", "LNI": "222"}
+        with patch.object(self.checker, "initialize"), patch.object(
+            self.checker, "_set_field"
+        ) as set_field, patch.object(self.checker, "_set_date_field"), patch.object(
+            self.checker, "_search"
+        ) as search, patch.object(
+            self.checker, "_capture_current_results", return_value=[first, unrelated]
+        ):
+            matches = self.checker.find_existing_counsel(
+                "380275", date(2024, 8, 17), date(2026, 8, 17)
+            )
+
+        search.assert_called_once_with()
+        self.assertEqual(
+            set_field.call_args_list,
+            [
+                unittest.mock.call(self.checker.COURT_ID, "STMIAP00"),
+                unittest.mock.call(self.checker.DOCKET_ID, "380275"),
+                unittest.mock.call(
+                    self.checker.FILE_NAME_ID, "*380275*counsel*"
+                ),
+            ],
+        )
+        self.assertEqual(matches, [first])
+
 if __name__ == "__main__":
     unittest.main()

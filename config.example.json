@@ -7,6 +7,7 @@
   "browser_timeout_seconds": 60,
   "irt_timeout_seconds": 120,
   "download_timeout_seconds": 90,
+  "location_check_timeout_seconds": 8,
   "request_delay_seconds": 1.0,
   "page_size": 100,
   "sort_order": "Newest",
@@ -16,5 +17,7 @@
   "max_pages": 0,
   "fail_closed_on_irt_error": true,
   "require_nonempty_irt_index": true,
+  "collect_counsel": true,
+  "counsel_irt_years_back": 2,
   "chromedriver_path": ""
 }

@@ -52,6 +52,8 @@ class CancellationTests(unittest.TestCase):
                 cancel_event.set()
 
         with tempfile.TemporaryDirectory() as temp_root, patch(
+            "core.collector.verify_us_location"
+        ), patch(
             "core.collector.MichiganOrdersSite",
             return_value=site,
         ), patch(
@@ -77,12 +79,24 @@ class CancellationTests(unittest.TestCase):
             )
             run_dir = collector.run()
 
-            collected_dir = run_dir / f"Collected_{run_dir.name}"
-            self.assertEqual(list(collected_dir.iterdir()), [])
+            orders_dir = run_dir / f"Collected_Orders_{run_dir.name}"
+            counsels_dir = run_dir / f"Collected_Counsels_{run_dir.name}"
+            excluded_dir = run_dir / "Excluded"
+            self.assertFalse(orders_dir.exists())
+            self.assertFalse(counsels_dir.exists())
+            self.assertFalse(excluded_dir.exists())
 
         irt.load_existing.assert_not_called()
         self.assertEqual(collector.last_counts.get("cancelled"), 1)
         self.assertEqual(collector.last_counts.get("error", 0), 0)
+        self.assertTrue(collector.was_cancelled)
+        self.assertTrue(
+            any(
+                call.args and call.args[0].startswith("Run %s:")
+                and call.args[1] == "stopped"
+                for call in logger.info.call_args_list
+            )
+        )
         site.close.assert_called_once()
         irt.close.assert_called_once()
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import sys
 import unittest
 from unittest.mock import Mock, patch
@@ -6,24 +7,113 @@ from unittest.mock import Mock, patch
 from config.settings import Settings
 from core.collector import (
     MIAP00Collector,
+    collected_counsels_directory_for_run,
     collected_directory_for_run,
+    collected_orders_directory_for_run,
+    excluded_directory_for_run,
 )
 from core.models import OrderResult
+from core.naming import sha256_file
 
 
 class CollectorFlowTests(unittest.TestCase):
-    def test_collected_files_use_run_named_subfolder(self):
+    def test_collected_files_use_separate_run_named_subfolders(self):
         run_dir = Path("output") / "MIAP00_08-15-2026_18-01-23-355"
         self.assertEqual(
-            collected_directory_for_run(run_dir),
-            run_dir / "Collected_MIAP00_08-15-2026_18-01-23-355",
+            collected_orders_directory_for_run(run_dir),
+            run_dir / "Collected_Orders_MIAP00_08-15-2026_18-01-23-355",
         )
+        self.assertEqual(
+            collected_counsels_directory_for_run(run_dir),
+            run_dir / "Collected_Counsels_MIAP00_08-15-2026_18-01-23-355",
+        )
+        self.assertEqual(
+            collected_directory_for_run(run_dir),
+            collected_orders_directory_for_run(run_dir),
+        )
+        self.assertEqual(excluded_directory_for_run(run_dir), run_dir / "Excluded")
+
+    def test_collected_folder_is_created_only_when_needed_and_empty_one_is_removed(self):
+        with TemporaryDirectory() as directory:
+            collector = MIAP00Collector(Settings())
+            collector.collected_dir = Path(directory) / "Collected_Orders_test"
+            collector.counsel_dir = Path(directory) / "Collected_Counsels_test"
+            collector.excluded_dir = Path(directory) / "Excluded"
+
+            self.assertFalse(collector.collected_dir.exists())
+            self.assertFalse(collector.counsel_dir.exists())
+            collector._remove_empty_collected_dir()
+            self.assertFalse(collector.collected_dir.exists())
+
+            collector._ensure_collected_dir()
+            self.assertTrue(collector.collected_dir.is_dir())
+            collector._remove_empty_collected_dir()
+            self.assertFalse(collector.collected_dir.exists())
+
+            collector._ensure_counsel_dir()
+            self.assertTrue(collector.counsel_dir.is_dir())
+            collector._remove_empty_collected_dir()
+            self.assertFalse(collector.counsel_dir.exists())
+
+            collector._ensure_excluded_dir()
+            self.assertTrue(collector.excluded_dir.is_dir())
+            collector._remove_empty_collected_dir()
+            self.assertFalse(collector.excluded_dir.exists())
+
+    def test_nonempty_collected_folder_is_never_removed(self):
+        with TemporaryDirectory() as directory:
+            collector = MIAP00Collector(Settings())
+            collector.collected_dir = Path(directory) / "Collected_Orders_test"
+            collector.counsel_dir = Path(directory) / "Collected_Counsels_test"
+            collector.excluded_dir = Path(directory) / "Excluded"
+            collector._ensure_collected_dir()
+            artifact = collector.collected_dir / "sample.pdf"
+            artifact.write_bytes(b"%PDF-test")
+
+            collector._remove_empty_collected_dir()
+
+            self.assertTrue(artifact.is_file())
+
+    def test_excluded_file_is_preserved_with_original_filename(self):
+        with TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            source = run_dir / "00015_379060_48_01.pdf"
+            source.write_bytes(b"%PDF-party-filing")
+            collector = MIAP00Collector(Settings())
+            collector.logger = Mock()
+            collector.excluded_dir = run_dir / "Excluded"
+            order = OrderResult(
+                page=1,
+                position=15,
+                docket="379060",
+                title="LARSON V LARSON",
+                lower_court="KENT CIRCUIT COURT",
+                release_date="08/17/2026",
+                order_type="Order",
+                pdf_url="https://example.test/379060_48_01.pdf",
+                original_filename="379060_48_01.pdf",
+            )
+
+            record = collector._preserve_excluded_file(
+                order,
+                source,
+                source.stat().st_size,
+                "Received party filing",
+            )
+
+            destination = collector.excluded_dir / "379060_48_01.pdf"
+            self.assertTrue(destination.is_file())
+            self.assertFalse(source.exists())
+            self.assertEqual(record.status, "non_order")
+            self.assertEqual(record.target_filename, "379060_48_01.pdf")
+            self.assertEqual(record.sha256, sha256_file(destination))
 
     def _run_one(self, duplicate_records):
         settings = Settings(
             output_root="synthetic-output",
             start_date="2026-08-07",
             end_date="2026-08-14",
+            collect_counsel=False,
         )
         order = OrderResult(
             page=1,
@@ -65,7 +155,9 @@ class CollectorFlowTests(unittest.TestCase):
         def record_replace(destination):
             events.append(f"rename:{Path(destination).name}")
 
-        with patch("core.collector.MichiganOrdersSite", return_value=site), patch(
+        with patch("core.collector.verify_us_location") as location_check, patch(
+            "core.collector.MichiganOrdersSite", return_value=site
+        ), patch(
             "core.collector.IRTDuplicateChecker", return_value=irt
         ), patch(
             "core.collector.extract_document_date", return_value="08142026"
@@ -80,6 +172,7 @@ class CollectorFlowTests(unittest.TestCase):
         ):
             collector = MIAP00Collector(settings)
             run_dir = collector.run()
+        location_check.assert_called_once_with(timeout_seconds=8)
         return run_dir, irt, events, unlink
 
     def test_all_downloads_are_renamed_before_one_bulk_irt_check(self):

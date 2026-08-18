@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from core.naming import (
     NamingError,
+    NonOrderDocumentError,
     build_filename,
     docket_suffix,
     extract_document_date,
@@ -86,6 +87,39 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(result, "08122026")
         footer_ocr.assert_called_once()
         full_ocr.assert_not_called()
+
+    def test_received_party_filing_is_excluded_before_ocr(self):
+        filing = (
+            "ANNE ARGIROFF\nAttorney at Law\nAugust 17, 2026\n"
+            "Dear Clerk:\nPlease withdraw the Motion for Extension.\n"
+            "RECEIVED by MCOA 8/17/2026 7:32:47 AM"
+        )
+        with patch("core.naming.extract_pdf_text", return_value=filing), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr"
+        ) as footer_ocr, patch("core.naming.extract_pdf_text_with_ocr") as full_ocr:
+            with self.assertRaisesRegex(NonOrderDocumentError, "party filing"):
+                extract_document_date(
+                    Path("379060_48_01.pdf"), expected_date="08/17/2026"
+                )
+
+        footer_ocr.assert_not_called()
+        full_ocr.assert_not_called()
+
+    def test_received_stamp_does_not_exclude_certified_order(self):
+        text = (
+            "ORDER\nRECEIVED by MCOA 8/17/2026\n"
+            "A TRUE COPY ENTERED AND CERTIFIED\nAugust 17, 2026"
+        )
+        with patch("core.naming.extract_pdf_text", return_value=text), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value="August 17, 2026\nChief Clerk",
+        ):
+            self.assertEqual(
+                extract_document_date(
+                    Path("real-order.pdf"), expected_date="08/17/2026"
+                ),
+                "08172026",
+            )
 
     def test_panel_order_footer_uses_visible_release_date(self):
         with patch("core.naming.extract_pdf_text", return_value="ORDER"), patch(

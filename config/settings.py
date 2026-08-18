@@ -20,6 +20,7 @@ class Settings:
     browser_timeout_seconds: int = 60
     irt_timeout_seconds: int = 120
     download_timeout_seconds: int = 90
+    location_check_timeout_seconds: int = 8
     request_delay_seconds: float = 1.0
     page_size: int = 100
     sort_order: str = "Newest"
@@ -29,6 +30,8 @@ class Settings:
     max_pages: int = 0
     fail_closed_on_irt_error: bool = True
     require_nonempty_irt_index: bool = True
+    collect_counsel: bool = True
+    counsel_irt_years_back: int = 2
     chromedriver_path: str = ""
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

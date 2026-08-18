@@ -36,6 +36,10 @@ class NamingError(ValueError):
     pass
 
 
+class NonOrderDocumentError(NamingError):
+    """The Orders search returned a party filing rather than a court order."""
+
+
 def extract_source_docket(filename: str) -> str:
     match = MIAP00_SOURCE_PATTERN.search(Path(filename).name)
     if not match:
@@ -91,6 +95,11 @@ def extract_document_date(
         logger=logger,
         cancel_event=cancel_event,
     )
+    if _looks_like_received_party_filing(text):
+        raise NonOrderDocumentError(
+            f"Michigan Orders search returned a received party filing, not a "
+            f"certified court order: {pdf_path.name}"
+        )
     publication_date = _extract_publication_date(text, ("FOR PUBLICATION",))
     if publication_date:
         _validate_expected_date(
@@ -143,6 +152,24 @@ def extract_miap00_date_from_text(text: str) -> str:
         return ""
     publication_date = _extract_publication_date(text, ("FOR PUBLICATION",))
     return publication_date or _extract_order_date(text)
+
+
+def _looks_like_received_party_filing(text: str) -> bool:
+    """Recognize court-received submissions without misusing their filing date."""
+
+    if not text.strip():
+        return False
+    normalized = _normalize_line(text)
+    if "RECEIVED BY MCOA" not in normalized:
+        return False
+    if "A TRUE COPY ENTERED AND CERTIFIED" in normalized:
+        return False
+    lines = [_normalize_line(line) for line in text.splitlines() if line.strip()]
+    has_court_order_heading = any(
+        re.fullmatch(r"(?:AMENDED |CORRECTED )?ORDER", line)
+        for line in lines[:120]
+    )
+    return not has_court_order_heading
 
 
 def _extract_publication_date(text: str, expected_headers: tuple[str, ...]) -> str:

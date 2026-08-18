@@ -49,6 +49,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QStackedLayout,
+    QStyle,
+    QStyleOptionButton,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -58,12 +60,16 @@ from config.settings import Settings
 from core.collector import MIAP00Collector
 
 
-EXCLUDED_STATUSES = (
+DUPLICATE_STATUSES = (
     "duplicate",
     "consolidated_duplicate",
     "local_duplicate",
     "content_duplicate",
 )
+EXCLUDED_STATUSES = (
+    "non_order",
+)
+MESSAGE_KINDS = {"success", "warning", "error", "info"}
 
 
 def system_animations_enabled() -> bool:
@@ -241,64 +247,20 @@ class PaperIntroSplash(QWidget):
 def format_outcome_summary(
     counts: Mapping[str, int], *, failed: bool = False
 ) -> str:
-    collected = int(counts.get("collected", 0))
+    orders_collected = int(counts.get("collected", 0))
+    counsels_collected = int(counts.get("counsel_collected", 0))
+    duplicates = sum(int(counts.get(status, 0)) for status in DUPLICATE_STATUSES)
     excluded = sum(int(counts.get(status, 0)) for status in EXCLUDED_STATUSES)
     errors = int(counts.get("error", 0))
     if failed and errors == 0:
         errors = 1
-    return f"Collected: {collected}\nExcluded: {excluded}\nErrors: {errors}"
-
-
-class MessageGlyph(QWidget):
-    """Code-drawn status glyph for the collector's custom dialogs."""
-
-    COLORS = {
-        "success": QColor("#23c6b3"),
-        "warning": QColor("#f0b65a"),
-        "error": QColor("#ee7884"),
-        "info": QColor("#65bde8"),
-    }
-
-    def __init__(self, kind: str, parent=None):
-        super().__init__(parent)
-        self.kind = kind if kind in self.COLORS else "info"
-        self.setFixedSize(54, 54)
-
-    def paintEvent(self, event) -> None:
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = self.COLORS[self.kind]
-        fill = QColor(color)
-        fill.setAlpha(28)
-        painter.setPen(QPen(color, 1.5))
-        painter.setBrush(fill)
-        painter.drawEllipse(self.rect().adjusted(3, 3, -3, -3))
-
-        pen = QPen(color, 3.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        if self.kind == "success":
-            path = QPainterPath()
-            path.moveTo(16, 28)
-            path.lineTo(24, 36)
-            path.lineTo(39, 19)
-            painter.drawPath(path)
-        elif self.kind == "error":
-            painter.drawLine(19, 19, 35, 35)
-            painter.drawLine(35, 19, 19, 35)
-        else:
-            font = painter.font()
-            font.setBold(True)
-            font.setPointSize(19 if self.kind == "warning" else 17)
-            painter.setFont(font)
-            painter.drawText(
-                self.rect(),
-                Qt.AlignmentFlag.AlignCenter,
-                "!" if self.kind == "warning" else "i",
-            )
+    return (
+        f"Orders collected: {orders_collected}\n"
+        f"Counsels collected: {counsels_collected}\n"
+        f"Duplicates: {duplicates}\n"
+        f"Excludes: {excluded}\n"
+        f"Errors: {errors}"
+    )
 
 
 class ThemedMessageDialog(QDialog):
@@ -314,7 +276,7 @@ class ThemedMessageDialog(QDialog):
         action_text: str = "OK",
     ):
         super().__init__(parent)
-        self.kind = kind if kind in MessageGlyph.COLORS else "info"
+        self.kind = kind if kind in MESSAGE_KINDS else "info"
         self.setWindowTitle(title)
         self.setWindowFlags(
             Qt.WindowType.Dialog
@@ -355,12 +317,8 @@ class ThemedMessageDialog(QDialog):
         header.addWidget(close_button)
         layout.addLayout(header)
 
-        body = QHBoxLayout()
-        body.setSpacing(16)
-        body.setAlignment(Qt.AlignmentFlag.AlignTop)
-        body.addWidget(MessageGlyph(self.kind), 0, Qt.AlignmentFlag.AlignTop)
-        copy = QVBoxLayout()
-        copy.setSpacing(7)
+        body = QVBoxLayout()
+        body.setSpacing(7)
         title_label = QLabel(title, objectName="messageTitle")
         title_label.setWordWrap(True)
         message_label = QLabel(message, objectName="messageBody")
@@ -368,9 +326,8 @@ class ThemedMessageDialog(QDialog):
         message_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        copy.addWidget(title_label)
-        copy.addWidget(message_label)
-        body.addLayout(copy, 1)
+        body.addWidget(title_label)
+        body.addWidget(message_label)
         layout.addLayout(body)
 
         footer = QHBoxLayout()
@@ -501,6 +458,53 @@ class DatePicker(QFrame):
         self.editor.setEnabled(enabled)
 
 
+def checkbox_checkmark_path(indicator: QRectF) -> QPainterPath:
+    """Return a scale-independent check mark fitted to a checkbox indicator."""
+
+    path = QPainterPath()
+    path.moveTo(
+        indicator.left() + indicator.width() * 0.23,
+        indicator.top() + indicator.height() * 0.53,
+    )
+    path.lineTo(
+        indicator.left() + indicator.width() * 0.43,
+        indicator.top() + indicator.height() * 0.73,
+    )
+    path.lineTo(
+        indicator.left() + indicator.width() * 0.78,
+        indicator.top() + indicator.height() * 0.30,
+    )
+    return path
+
+
+class CheckMarkedBox(QCheckBox):
+    """Theme checkbox with an explicit, DPI-aware checked glyph."""
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self.checkState() != Qt.CheckState.Checked:
+            return
+
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        indicator = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator,
+            option,
+            self,
+        )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor("#f4fffd")
+        if not self.isEnabled():
+            color.setAlpha(130)
+        pen = QPen(color, max(2.0, indicator.width() * 0.13))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(checkbox_checkmark_path(QRectF(indicator)))
+
+
 class SheenProgressBar(QProgressBar):
     """Compact progress bar with a restrained moving highlight while active."""
 
@@ -574,7 +578,7 @@ class SheenProgressBar(QProgressBar):
 class CollectionWorker(QObject):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)
-    finished = pyqtSignal(bool, object, str, object)
+    finished = pyqtSignal(str, object, str, object)
 
     def __init__(self, settings: Settings, cancel_event: threading.Event):
         super().__init__()
@@ -591,15 +595,16 @@ class CollectionWorker(QObject):
         )
         try:
             run_dir = collector.run()
+            outcome = "cancelled" if collector.was_cancelled else "completed"
             self.finished.emit(
-                True,
+                outcome,
                 run_dir,
-                "Collection finished",
+                "Collection stopped" if collector.was_cancelled else "Collection finished",
                 dict(collector.last_counts),
             )
         except Exception as exc:
             self.finished.emit(
-                False,
+                "failed",
                 collector.run_dir,
                 f"{type(exc).__name__}: {exc}",
                 dict(collector.last_counts),
@@ -659,8 +664,24 @@ def friendly_status(line: str) -> str | None:
         return "True duplicate found and removed."
     if message.startswith("Post-run content duplicate check complete:"):
         return "PDF content quality check complete."
+    if message.startswith("Starting counsel IRT preflight"):
+        return "Preparing the counsel-file duplicate check…"
+    if message.startswith("[") and "Checking IRT counsel:" in message:
+        progress = message.split("]", 1)[0].lstrip("[")
+        return f"Checking counsel files in IRT  •  {progress}"
+    if message.startswith("[") and "Counsel recycled from IRT" in message:
+        progress = message.split("]", 1)[0].lstrip("[")
+        return f"Counsel already exists in IRT  •  {progress}"
+    if message.startswith("[") and "Collecting counsel file:" in message:
+        progress = message.split("]", 1)[0].lstrip("[")
+        filename = message.split("Collecting counsel file:", 1)[1].strip()
+        return f"Collecting counsel files  •  {progress}  •  {filename}"
+    if message.startswith("Counsel phase complete:"):
+        return "Counsel-file collection complete."
     if message.startswith("Run complete:"):
         return "Collection complete."
+    if message.startswith("Run stopped:"):
+        return "Collection stopped."
     return None
 
 
@@ -766,7 +787,7 @@ class CollectorWindow(QMainWindow):
         grid.addWidget(QLabel("Through", objectName="softLabel"), 1, 2)
         grid.addWidget(self.end_date, 1, 3)
 
-        self.headless = QCheckBox("Run Chrome in background")
+        self.headless = CheckMarkedBox("Run Chrome in background")
         self.headless.setChecked(self.settings.headless)
         grid.addWidget(QLabel("BROWSER", objectName="fieldLabel"), 2, 0)
         grid.addWidget(self.headless, 2, 1, 1, 3)
@@ -831,7 +852,7 @@ class CollectorWindow(QMainWindow):
         self.cancel_event.clear()
         self.last_run_dir = None
         self.progress_bar.setRange(0, 0)
-        self._set_status("Opening newest orders…")
+        self._set_status("Verifying U.S. VPN location…")
         self._set_running(True)
 
         self.thread = QThread(self)
@@ -868,15 +889,16 @@ class CollectorWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self._set_status(f"Processing renamed PDFs  •  {current} / {total}")
 
-    @pyqtSlot(bool, object, str, object)
+    @pyqtSlot(str, object, str, object)
     def _finished(
         self,
-        success: bool,
+        outcome: str,
         run_dir: object,
-        _message: str,
+        message: str,
         counts: object,
     ) -> None:
-        cancelled = self.cancel_event.is_set()
+        cancelled = outcome == "cancelled"
+        success = outcome == "completed"
         if run_dir:
             self.last_run_dir = Path(run_dir)
             self.open_button.setEnabled(True)
@@ -890,7 +912,7 @@ class CollectorWindow(QMainWindow):
         self._set_running(False)
         summary = format_outcome_summary(
             counts if isinstance(counts, Mapping) else {},
-            failed=not success,
+            failed=outcome == "failed",
         )
         if cancelled:
             acknowledged = show_themed_message(
@@ -910,7 +932,7 @@ class CollectorWindow(QMainWindow):
             acknowledged = show_themed_message(
                 self,
                 "Collection failed",
-                f"Collection stopped with errors.\n\n{summary}",
+                f"{message}\n\n{summary}",
                 kind="error",
             )
         if acknowledged and self.last_run_dir:

@@ -9,7 +9,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from core.models import OrderResult, ProcessingRecord
+from core.models import CounselRecord, OrderResult, ProcessingRecord
 
 
 def report_path_for_run(run_dir: Path) -> Path:
@@ -28,6 +28,7 @@ class ReportWriter:
         self,
         discovered: list[OrderResult],
         records: list[ProcessingRecord],
+        counsel_records: list[CounselRecord],
         started_at: datetime,
         finished_at: datetime,
         settings_snapshot: dict[str, Any],
@@ -36,6 +37,9 @@ class ReportWriter:
         counts: dict[str, int] = {}
         for record in records:
             counts[record.status] = counts.get(record.status, 0) + 1
+        counsel_counts: dict[str, int] = {}
+        for record in counsel_records:
+            counsel_counts[record.status] = counsel_counts.get(record.status, 0) + 1
         workbook = Workbook()
         workbook.remove(workbook.active)
         summary = workbook.create_sheet("Summary")
@@ -50,6 +54,10 @@ class ReportWriter:
             ("IRT-backed consolidated copies skipped", counts.get("consolidated_duplicate", 0)),
             ("Local duplicates skipped", counts.get("local_duplicate", 0)),
             ("Content duplicates removed", counts.get("content_duplicate", 0)),
+            ("Non-order filings excluded", counts.get("non_order", 0)),
+            ("Counsel files collected", counsel_counts.get("collected", 0)),
+            ("Counsel files recycled from IRT", counsel_counts.get("irt_existing", 0)),
+            ("Counsel errors", counsel_counts.get("error", 0)),
             ("Errors", counts.get("error", 0)),
             ("Cancelled", counts.get("cancelled", 0)),
             ("IRT court code", settings_snapshot.get("irt_court_code", "")),
@@ -66,9 +74,14 @@ class ReportWriter:
             in {"duplicate", "consolidated_duplicate", "local_duplicate", "content_duplicate"}
         ]
         errors = [row.as_dict() for row in records if row.status in {"error", "cancelled"}]
+        excluded = [row.as_dict() for row in records if row.status == "non_order"]
         self._add_filenames_sheet(workbook, records)
         self._add_records_sheet(workbook, "Collected", collected)
         self._add_records_sheet(workbook, "Duplicates", duplicates)
+        self._add_records_sheet(workbook, "Excluded", excluded)
+        self._add_records_sheet(
+            workbook, "Counsel", [row.as_dict() for row in counsel_records]
+        )
         self._add_records_sheet(workbook, "Errors", errors)
         self._add_records_sheet(workbook, "Discovered", [row.as_dict() for row in discovered])
         workbook.save(report_path)
@@ -79,10 +92,12 @@ class ReportWriter:
         self, workbook, records: list[ProcessingRecord]
     ) -> None:
         sheet = workbook.create_sheet("Filenames")
-        sheet.append(["Filename"])
+        sheet.append(["Main Document Filename", "Counsel Filename / Recycled LNI"])
         for record in records:
             if record.status == "collected" and record.target_filename:
-                sheet.append([record.target_filename])
+                sheet.append(
+                    [record.target_filename, "\n".join(record.counsel_references)]
+                )
         self._style(sheet)
 
     def _add_records_sheet(self, workbook, name: str, rows: list[dict[str, Any]]) -> None:

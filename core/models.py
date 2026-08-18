@@ -39,8 +39,36 @@ class ProcessingRecord:
     irt_evidence: list[dict[str, Any]] = field(default_factory=list)
     bytes: int = 0
     sha256: str = ""
+    related_dockets: list[str] = field(default_factory=list)
+    duplicate_parent_filename: str = ""
+    counsel_references: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["irt_evidence"] = self.irt_evidence
         return data
+
+
+@dataclass
+class CounselRecord:
+    docket: str
+    status: str
+    target_filename: str = ""
+    lnis: list[str] = field(default_factory=list)
+    irt_evidence: list[dict[str, Any]] = field(default_factory=list)
+    case_url: str = ""
+    reason: str = ""
+
+    def reference(self, *, include_docket: bool = True) -> str:
+        if self.status == "irt_existing":
+            values = "; ".join(self.lnis)
+        elif self.status == "collected":
+            values = self.target_filename
+        else:
+            return ""
+        if not values:
+            return ""
+        return f"{self.docket}: {values}" if include_docket else values
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)

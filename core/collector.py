@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import logging
 from pathlib import Path
 import shutil
@@ -12,15 +12,18 @@ from typing import Callable
 from config.settings import Settings
 from .cancellation import CollectionCancelled, raise_if_cancelled
 from .content_duplicates import (
-    find_irt_backed_consolidated_duplicates,
+    find_irt_backed_content_duplicates,
     remove_content_duplicates,
 )
 from browser.irt import IRTDuplicateChecker, IRTError
+from browser.michigan_counsel import CounselCollectionError, MichiganCounselSite
 from browser.michigan_courts import MichiganOrdersSite
 from reporting.excel_report import ReportWriter
 from utils.logging import create_logger
-from .models import OrderResult, ProcessingRecord
+from .models import CounselRecord, OrderResult, ProcessingRecord
+from .location_check import verify_us_location
 from .naming import (
+    NonOrderDocumentError,
     build_filename,
     extract_document_date,
     extract_source_docket,
@@ -32,8 +35,22 @@ class CollectionError(RuntimeError):
     pass
 
 
+def collected_orders_directory_for_run(run_dir: Path) -> Path:
+    return run_dir / f"Collected_Orders_{run_dir.name}"
+
+
+def collected_counsels_directory_for_run(run_dir: Path) -> Path:
+    return run_dir / f"Collected_Counsels_{run_dir.name}"
+
+
+def excluded_directory_for_run(run_dir: Path) -> Path:
+    return run_dir / "Excluded"
+
+
 def collected_directory_for_run(run_dir: Path) -> Path:
-    return run_dir / f"Collected_{run_dir.name}"
+    """Backward-compatible name for the collected Orders destination."""
+
+    return collected_orders_directory_for_run(run_dir)
 
 
 @dataclass
@@ -61,17 +78,27 @@ class MIAP00Collector:
         self.cancel_event = cancel_event or threading.Event()
         self.run_dir: Path | None = None
         self.collected_dir: Path | None = None
+        self.counsel_dir: Path | None = None
+        self.excluded_dir: Path | None = None
         self.logger: logging.Logger | None = None
         self.last_counts: dict[str, int] = {}
+        self.counsel_records: list[CounselRecord] = []
+        self.was_cancelled = False
 
     def run(self) -> Path:
+        self.was_cancelled = False
+        self.counsel_records = []
+        location = verify_us_location(
+            timeout_seconds=self.settings.location_check_timeout_seconds
+        )
         started_at = datetime.now()
         timestamp = started_at.strftime("%m-%d-%Y_%H-%M-%S-%f")[:-3]
         self.run_dir = self.settings.resolved_output_root() / f"MIAP00_{timestamp}"
-        self.collected_dir = collected_directory_for_run(self.run_dir)
+        self.collected_dir = collected_orders_directory_for_run(self.run_dir)
+        self.counsel_dir = collected_counsels_directory_for_run(self.run_dir)
+        self.excluded_dir = excluded_directory_for_run(self.run_dir)
         temp_dir = self.run_dir / ".temporary_downloads"
         self.run_dir.mkdir(parents=True, exist_ok=False)
-        self.collected_dir.mkdir()
         temp_dir.mkdir()
         self.logger, _ = create_logger(self.run_dir, self.log_callback)
         site = MichiganOrdersSite(self.settings, self.logger)
@@ -85,8 +112,22 @@ class MIAP00Collector:
         pending: list[PendingDownload] = []
         try:
             self.logger.info("MIAP00 Orders Collector started")
+            self.logger.info(
+                "U.S. location preflight passed: %s", location.display_name
+            )
             self.logger.info("Run folder: %s", self.run_dir)
-            self.logger.info("Collected files folder: %s", self.collected_dir)
+            self.logger.info(
+                "Collected Orders folder (created when needed): %s",
+                self.collected_dir,
+            )
+            self.logger.info(
+                "Collected Counsels folder (created when needed): %s",
+                self.counsel_dir,
+            )
+            self.logger.info(
+                "Excluded review folder (created when needed): %s",
+                self.excluded_dir,
+            )
             self.logger.info("Selector strategy: text/labels/options/stable result classes; uid selectors disabled")
             raise_if_cancelled(self.cancel_event)
             discovered = site.collect_result_metadata(self.cancel_event)
@@ -154,6 +195,37 @@ class MIAP00Collector:
                 except CollectionCancelled:
                     temp_path.unlink(missing_ok=True)
                     raise
+                except NonOrderDocumentError as exc:
+                    try:
+                        records.append(
+                            self._preserve_excluded_file(
+                                order,
+                                temp_path,
+                                byte_count,
+                                str(exc),
+                            )
+                        )
+                    except Exception as preserve_exc:
+                        temp_path.unlink(missing_ok=True)
+                        self.logger.exception(
+                            "Failed preserving excluded file %s",
+                            order.original_filename,
+                        )
+                        records.append(
+                            ProcessingRecord(
+                                status="error",
+                                docket=order.docket,
+                                title=order.title,
+                                release_date=order.release_date,
+                                source_filename=order.original_filename,
+                                source_url=order.pdf_url,
+                                lower_court=order.lower_court,
+                                page=order.page,
+                                reason=(
+                                    f"{type(preserve_exc).__name__}: {preserve_exc}"
+                                ),
+                            )
+                        )
                 except Exception as exc:
                     temp_path.unlink(missing_ok=True)
                     self.logger.exception("Failed processing %s", order.original_filename)
@@ -228,7 +300,7 @@ class MIAP00Collector:
                     )
                     for item in pending
                 ]
-                consolidated_matches = find_irt_backed_consolidated_duplicates(
+                irt_content_matches = find_irt_backed_content_duplicates(
                     comparison_records,
                     exact_matches,
                     self.logger,
@@ -261,20 +333,46 @@ class MIAP00Collector:
                         item.path.unlink(missing_ok=True)
                         continue
 
-                    consolidated = consolidated_matches.get(item.target_filename)
-                    if consolidated:
-                        shared = ", ".join(consolidated.shared_dockets)
+                    content_match = irt_content_matches.get(item.target_filename)
+                    if content_match:
+                        shared = ", ".join(content_match.shared_dockets)
+                        if content_match.match_kind == "same_docket":
+                            reason = (
+                                "IRT-backed same-docket content duplicate; online parent "
+                                f"{content_match.parent_filename}; {content_match.method}"
+                            )
+                            self.logger.info(
+                                "IRT same-docket content duplicate skipped: %s "
+                                "(online parent %s; %s)",
+                                item.target_filename,
+                                content_match.parent_filename,
+                                content_match.method,
+                            )
+                            records.append(
+                                self._record(
+                                    item.order,
+                                    "content_duplicate",
+                                    item.target_filename,
+                                    item.document_date,
+                                    item.byte_count,
+                                    item.path,
+                                    reason,
+                                    content_match.irt_evidence,
+                                )
+                            )
+                            item.path.unlink(missing_ok=True)
+                            continue
                         reason = (
                             "IRT-backed consolidated copy; online parent "
-                            f"{consolidated.parent_filename}; shared appellate dockets "
+                            f"{content_match.parent_filename}; shared appellate dockets "
                             f"{shared}; normalized content similarity "
-                            f"{consolidated.similarity:.1%}"
+                            f"{content_match.similarity:.1%}"
                         )
                         self.logger.info(
                             "IRT consolidated duplicate skipped: %s "
                             "(online parent %s; shared dockets %s)",
                             item.target_filename,
-                            consolidated.parent_filename,
+                            content_match.parent_filename,
                             shared,
                         )
                         records.append(
@@ -286,7 +384,7 @@ class MIAP00Collector:
                                 item.byte_count,
                                 item.path,
                                 reason,
-                                consolidated.irt_evidence,
+                                content_match.irt_evidence,
                             )
                         )
                         item.path.unlink(missing_ok=True)
@@ -315,6 +413,7 @@ class MIAP00Collector:
                         continue
 
                     digest = sha256_file(item.path)
+                    self._ensure_collected_dir()
                     item.path.replace(target_path)
                     record = self._record(
                         item.order,
@@ -339,8 +438,11 @@ class MIAP00Collector:
                 self.logger,
                 cancel_event=self.cancel_event,
             )
+            if self.settings.collect_counsel:
+                self._collect_counsel(records, site, irt)
             return self._finish_report(discovered, records, started_at)
         except CollectionCancelled as exc:
+            self.was_cancelled = True
             self.logger.info("Collection stopped by user: %s", exc)
             self._record_cancelled_items(discovered, records, pending)
             return self._finish_report(discovered, records, started_at)
@@ -364,8 +466,86 @@ class MIAP00Collector:
             irt.close()
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
+            self._remove_empty_collected_dir()
             if self.logger:
                 self.logger.info("Browser sessions and temporary storage closed")
+
+    def _ensure_collected_dir(self) -> None:
+        if self.collected_dir is None:
+            raise CollectionError("Collected files destination was not initialized")
+        self.collected_dir.mkdir(parents=False, exist_ok=True)
+
+    def _ensure_counsel_dir(self) -> None:
+        if self.counsel_dir is None:
+            raise CollectionError("Collected Counsels destination was not initialized")
+        self.counsel_dir.mkdir(parents=False, exist_ok=True)
+
+    def _ensure_excluded_dir(self) -> None:
+        if self.excluded_dir is None:
+            raise CollectionError("Excluded review destination was not initialized")
+        self.excluded_dir.mkdir(parents=False, exist_ok=True)
+
+    def _preserve_excluded_file(
+        self,
+        order: OrderResult,
+        source_path: Path,
+        byte_count: int,
+        reason: str,
+    ) -> ProcessingRecord:
+        """Keep an excluded source PDF unchanged for post-run spot-checking."""
+
+        if self.excluded_dir is None:
+            raise CollectionError("Excluded review destination was not initialized")
+        destination = self.excluded_dir / order.original_filename
+        if destination.exists():
+            raise CollectionError(
+                f"Excluded source filename already exists: {order.original_filename}"
+            )
+        digest = sha256_file(source_path)
+        self._ensure_excluded_dir()
+        source_path.replace(destination)
+        self.logger.warning(
+            "Excluded non-order filing saved for review without renaming: %s (%s)",
+            order.original_filename,
+            reason,
+        )
+        return ProcessingRecord(
+            status="non_order",
+            docket=order.docket,
+            title=order.title,
+            release_date=order.release_date,
+            source_filename=order.original_filename,
+            source_url=order.pdf_url,
+            target_filename=order.original_filename,
+            lower_court=order.lower_court,
+            page=order.page,
+            reason=reason,
+            bytes=byte_count,
+            sha256=digest,
+        )
+
+    def _remove_empty_collected_dir(self) -> None:
+        """Remove only the run-scoped collected directory when it is empty."""
+
+        for label, directory in (
+            ("Orders", self.collected_dir),
+            ("Counsels", self.counsel_dir),
+            ("excluded files", self.excluded_dir),
+        ):
+            if directory is None:
+                continue
+            try:
+                directory.rmdir()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # A non-empty folder, open handle, or external filesystem issue
+                # is intentionally left untouched.
+                continue
+            if self.logger:
+                self.logger.info(
+                    "No %s collected; empty collected folder removed", label
+                )
 
     def _record_cancelled_items(
         self,
@@ -410,9 +590,21 @@ class MIAP00Collector:
         for record in records:
             counts[record.status] = counts.get(record.status, 0) + 1
         self.last_counts = {"discovered": len(discovered), **counts}
+        self.last_counts["counsel_collected"] = sum(
+            record.status == "collected" for record in self.counsel_records
+        )
+        self.last_counts["counsel_irt_existing"] = sum(
+            record.status == "irt_existing" for record in self.counsel_records
+        )
+        counsel_errors = sum(
+            record.status == "error" for record in self.counsel_records
+        )
+        if counsel_errors:
+            self.last_counts["error"] = self.last_counts.get("error", 0) + counsel_errors
         ReportWriter(self.run_dir, self.logger).write(
             discovered,
             records,
+            self.counsel_records,
             started_at,
             datetime.now(),
             self.settings.to_dict(),
@@ -427,15 +619,175 @@ class MIAP00Collector:
                 "content_duplicate",
             )
         )
-        errors = counts.get("error", 0)
+        errors = counts.get("error", 0) + counsel_errors
+        run_outcome = "stopped" if self.was_cancelled else "complete"
         self.logger.info(
-            "Run complete: discovered=%d collected=%d duplicates=%d errors=%d",
+            "Run %s: discovered=%d collected=%d duplicates=%d errors=%d",
+            run_outcome,
             len(discovered),
             collected,
             duplicates,
             errors,
         )
         return self.run_dir
+
+    def _collect_counsel(
+        self,
+        records: list[ProcessingRecord],
+        site: MichiganOrdersSite,
+        irt: IRTDuplicateChecker,
+    ) -> None:
+        """Collect or recycle one counsel artifact for every retained docket."""
+
+        collected_records = [record for record in records if record.status == "collected"]
+        if not collected_records:
+            return
+        ordered_dockets: list[str] = []
+        for record in collected_records:
+            dockets = record.related_dockets or ([record.docket] if record.docket else [])
+            for docket in dockets:
+                if docket and docket not in ordered_dockets:
+                    ordered_dockets.append(docket)
+        if not ordered_dockets:
+            return
+
+        start_date, end_date = self._counsel_irt_date_range()
+        self.logger.info(
+            "Starting counsel IRT preflight for %d docket(s): %s through %s",
+            len(ordered_dockets),
+            start_date.strftime("%m-%d-%Y"),
+            end_date.strftime("%m-%d-%Y"),
+        )
+        irt_matches: dict[str, list[dict]] = {}
+        try:
+            for index, docket in enumerate(ordered_dockets, 1):
+                raise_if_cancelled(
+                    self.cancel_event,
+                    "Collection stopped during counsel IRT preflight",
+                )
+                self.logger.info(
+                    "[%d/%d] Checking IRT counsel: %s",
+                    index,
+                    len(ordered_dockets),
+                    docket,
+                )
+                irt_matches[docket] = irt.find_existing_counsel(
+                    docket,
+                    start_date,
+                    end_date,
+                )
+        except IRTError as exc:
+            reason = (
+                "Counsel collection skipped because the complete IRT preflight "
+                f"could not be verified: {exc}"
+            )
+            self.logger.error(reason)
+            self.counsel_records.extend(
+                CounselRecord(docket=docket, status="error", reason=reason)
+                for docket in ordered_dockets
+            )
+            return
+
+        counsel_site = MichiganCounselSite(self.settings, self.logger, site)
+        total = len(ordered_dockets)
+        for index, docket in enumerate(ordered_dockets, 1):
+            raise_if_cancelled(
+                self.cancel_event,
+                "Collection stopped during counsel collection",
+            )
+            matches = irt_matches[docket]
+            if matches:
+                lnis: list[str] = []
+                for match in matches:
+                    lni = str(match.get("LNI", "")).strip()
+                    if lni and lni not in lnis:
+                        lnis.append(lni)
+                self.counsel_records.append(
+                    CounselRecord(
+                        docket=docket,
+                        status="irt_existing",
+                        lnis=lnis,
+                        irt_evidence=matches,
+                        reason="Matching counsel filename already exists in IRT",
+                    )
+                )
+                self.logger.info(
+                    "[%d/%d] Counsel recycled from IRT for %s: %s",
+                    index,
+                    total,
+                    docket,
+                    ", ".join(lnis) or "LNI unavailable",
+                )
+                continue
+
+            filename = f"LDC_SMD_{docket}counsel.html"
+            if self.counsel_dir is None:
+                raise CollectionError("Collected Counsels destination was not initialized")
+            destination = self.counsel_dir / filename
+            try:
+                self.logger.info(
+                    "[%d/%d] Collecting counsel file: %s",
+                    index,
+                    total,
+                    filename,
+                )
+                if destination.exists():
+                    raise CounselCollectionError(
+                        f"Counsel target already exists and will not be overwritten: {filename}"
+                    )
+                self._ensure_counsel_dir()
+                case_url = counsel_site.collect(
+                    docket,
+                    destination,
+                    cancel_event=self.cancel_event,
+                )
+                self.counsel_records.append(
+                    CounselRecord(
+                        docket=docket,
+                        status="collected",
+                        target_filename=filename,
+                        case_url=case_url,
+                        reason="Passed STMIAP00 IRT counsel duplicate preflight",
+                    )
+                )
+            except CollectionCancelled:
+                destination.unlink(missing_ok=True)
+                raise
+            except Exception as exc:
+                destination.unlink(missing_ok=True)
+                reason = f"{type(exc).__name__}: {exc}"
+                self.logger.exception("Counsel collection failed for docket %s", docket)
+                self.counsel_records.append(
+                    CounselRecord(docket=docket, status="error", reason=reason)
+                )
+
+        counsel_by_docket = {record.docket: record for record in self.counsel_records}
+        for record in collected_records:
+            dockets = record.related_dockets or ([record.docket] if record.docket else [])
+            include_docket = len(dict.fromkeys(dockets)) > 1
+            record.counsel_references = [
+                counsel_by_docket[docket].reference(include_docket=include_docket)
+                for docket in dockets
+                if docket in counsel_by_docket
+                and counsel_by_docket[docket].reference(
+                    include_docket=include_docket
+                )
+            ]
+        self.logger.info(
+            "Counsel phase complete: collected=%d existing_in_irt=%d errors=%d",
+            sum(record.status == "collected" for record in self.counsel_records),
+            sum(record.status == "irt_existing" for record in self.counsel_records),
+            sum(record.status == "error" for record in self.counsel_records),
+        )
+
+    def _counsel_irt_date_range(self, today: date | None = None) -> tuple[date, date]:
+        end = today or date.today()
+        years = max(1, int(self.settings.counsel_irt_years_back))
+        try:
+            start = end.replace(year=end.year - years)
+        except ValueError:
+            start = end.replace(year=end.year - years, day=28)
+        return start, end
 
     @staticmethod
     def _record(
