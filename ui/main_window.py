@@ -659,7 +659,7 @@ def friendly_status(line: str) -> str | None:
     if message.startswith("Collected:"):
         return f"Saved {message.split(':', 1)[1].split(' (', 1)[0].strip()}"
     if message.startswith("Post-run content duplicate check:"):
-        return "Checking downloaded PDFs for true duplicatesâ€¦"
+        return "Checking downloaded PDFs for true duplicates…"
     if message.startswith("Content duplicate removed:"):
         return "True duplicate found and removed."
     if message.startswith("Post-run content duplicate check complete:"):

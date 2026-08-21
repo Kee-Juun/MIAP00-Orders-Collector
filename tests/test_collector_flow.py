@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
@@ -108,7 +109,7 @@ class CollectorFlowTests(unittest.TestCase):
             self.assertEqual(record.target_filename, "379060_48_01.pdf")
             self.assertEqual(record.sha256, sha256_file(destination))
 
-    def _run_one(self, duplicate_records):
+    def _run_one(self, duplicate_records, document_date="08142026"):
         settings = Settings(
             output_root="synthetic-output",
             start_date="2026-08-07",
@@ -138,7 +139,7 @@ class CollectorFlowTests(unittest.TestCase):
         )
         irt = Mock()
 
-        expected = "LDC_SMD_381603_08142026.pdf"
+        expected = f"LDC_SMD_381603_{document_date}.pdf"
         existing = {expected.lower(): duplicate_records} if duplicate_records else {}
 
         def load_existing(start_date, end_date):
@@ -160,7 +161,7 @@ class CollectorFlowTests(unittest.TestCase):
         ), patch(
             "core.collector.IRTDuplicateChecker", return_value=irt
         ), patch(
-            "core.collector.extract_document_date", return_value="08142026"
+            "core.collector.extract_document_date", return_value=document_date
         ), patch("core.collector.ReportWriter.write"), patch(
             "core.collector.create_logger", return_value=(logger, Path("log"))
         ), patch("pathlib.Path.mkdir"), patch(
@@ -190,6 +191,26 @@ class CollectorFlowTests(unittest.TestCase):
         )
         irt.load_existing.assert_called_once()
         irt.check_one.assert_not_called()
+
+    def test_irt_snapshot_starts_at_oldest_certified_decision_date(self):
+        _run_dir, irt, events, _unlink = self._run_one(
+            [], document_date="07132026"
+        )
+        expected = "LDC_SMD_381603_07132026.pdf"
+
+        self.assertEqual(
+            events,
+            [
+                "download",
+                f"rename:{expected}",
+                "irt-load:2026-07-13:2026-08-14",
+                f"irt-compare:{expected}",
+                f"rename:{expected}",
+            ],
+        )
+        irt.load_existing.assert_called_once_with(
+            date(2026, 7, 13), date(2026, 8, 14)
+        )
 
     def test_irt_duplicate_is_deleted_without_finalization(self):
         _run_dir, irt, events, unlink = self._run_one([{"LNI": "duplicate"}])

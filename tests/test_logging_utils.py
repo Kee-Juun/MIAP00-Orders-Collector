@@ -53,6 +53,15 @@ class LoggingFormatTests(unittest.TestCase):
         self.assertIsNotNone(status)
         self.assertIn("65/76", status)
 
+    def test_true_duplicate_status_uses_clean_unicode_ellipsis(self):
+        line = (
+            "08/19/2026 - 06:35 PM - INFO - "
+            "Post-run content duplicate check: 34 collected PDF(s)"
+        )
+        status = friendly_status(line)
+        self.assertEqual(status, "Checking downloaded PDFs for true duplicates…")
+        self.assertNotIn(chr(0x00E2), status)
+
     def test_friendly_status_reports_stopped_run(self):
         line = (
             "08/17/2026 - 10:45 AM - INFO - "

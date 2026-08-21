@@ -17,7 +17,7 @@ from .cancellation import CollectionCancelled, raise_if_cancelled
 
 MIAP00_SOURCE_PATTERN = re.compile(
     r"(?:(\d{8})_C(\d+)(?:_\d+_\2[A-Z]?\.opn(?:_ORDER)?\.pdf|"
-    r"\(\d+\)_RPTR_[A-Z0-9]+-\2-ASV\.+pdf)|(\d+)_\d+_\d+\.pdf)$",
+    r"\(\d+\)_RPTR_[A-Z0-9]+-\2-ASV\.+pdf)|(\d+)_\d+(?:_\d+)?\.pdf)$",
     re.IGNORECASE,
 )
 _MONTH_DATE_TEXT_PATTERN = (
@@ -37,7 +37,7 @@ class NamingError(ValueError):
 
 
 class NonOrderDocumentError(NamingError):
-    """The Orders search returned a party filing rather than a court order."""
+    """The Orders search returned a document that is not a court order."""
 
 
 def extract_source_docket(filename: str) -> str:
@@ -95,6 +95,11 @@ def extract_document_date(
         logger=logger,
         cancel_event=cancel_event,
     )
+    if _looks_like_non_order_clerk_correspondence(text):
+        raise NonOrderDocumentError(
+            f"Michigan Orders search returned clerk correspondence, not a "
+            f"certified court order: {pdf_path.name}"
+        )
     if _looks_like_received_party_filing(text):
         raise NonOrderDocumentError(
             f"Michigan Orders search returned a received party filing, not a "
@@ -122,6 +127,7 @@ def extract_document_date(
         cancel_event=cancel_event,
     )
     date_value = _extract_order_date(footer_text)
+    has_certified_footer_date = bool(date_value)
     if not date_value:
         date_value = _extract_expected_date_from_footer(footer_text, expected_date)
     if not date_value:
@@ -133,6 +139,7 @@ def extract_document_date(
             cancel_event=cancel_event,
         )
         date_value = _extract_order_date(ocr_text)
+        has_certified_footer_date = bool(date_value)
     if not date_value:
         raise NamingError(
             f"No certified MIAP00 decision date found in {pdf_path.name}"
@@ -142,6 +149,7 @@ def extract_document_date(
         expected_date,
         pdf_path,
         allowed_date_range=allowed_date_range,
+        certified_footer_date=has_certified_footer_date,
         logger=logger,
     )
     return date_value
@@ -152,6 +160,27 @@ def extract_miap00_date_from_text(text: str) -> str:
         return ""
     publication_date = _extract_publication_date(text, ("FOR PUBLICATION",))
     return publication_date or _extract_order_date(text)
+
+
+def _looks_like_non_order_clerk_correspondence(text: str) -> bool:
+    """Recognize clerk letters without mistaking an attached order for one."""
+
+    if not text.strip():
+        return False
+    normalized = _normalize_line(text)
+    lines = [_normalize_line(line) for line in text.splitlines() if line.strip()]
+    has_order_heading = any(
+        re.fullmatch(r"(?:AMENDED |CORRECTED )?ORDER", line)
+        for line in lines[:160]
+    )
+    if has_order_heading or "A TRUE COPY ENTERED AND CERTIFIED" in normalized:
+        return False
+    return (
+        "MICHIGAN COURT OF APPEALS" in normalized
+        and "OFFICE OF THE CLERK" in normalized
+        and "DEAR COUNSEL" in normalized
+        and "SINCERELY" in normalized
+    )
 
 
 def _looks_like_received_party_filing(text: str) -> bool:
@@ -247,15 +276,30 @@ def _validate_expected_date(
     pdf_path: Path,
     *,
     allowed_date_range: tuple[datetime.date, datetime.date] | None = None,
+    certified_footer_date: bool = False,
     logger=None,
 ) -> None:
     expected = _normalize_expected_date(expected_date)
     if expected and date_value != expected:
         certified_date = datetime.datetime.strptime(date_value, "%m%d%Y").date()
-        if (
+        inside_selected_range = (
             allowed_date_range is not None
             and allowed_date_range[0] <= certified_date <= allowed_date_range[1]
-        ):
+        )
+        if certified_footer_date or inside_selected_range:
+            if certified_footer_date and not inside_selected_range:
+                acceptance_reason = (
+                    "The site released or reposted an older certified order; "
+                    "the certification footer controls the final filename."
+                )
+            elif allowed_date_range is not None:
+                acceptance_reason = (
+                    "The certified date is inside the selected range "
+                    f"{allowed_date_range[0].isoformat()} through "
+                    f"{allowed_date_range[1].isoformat()}."
+                )
+            else:
+                acceptance_reason = "The certification footer controls the final filename."
             _log(
                 logger,
                 "warning",
@@ -263,9 +307,7 @@ def _validate_expected_date(
                 f"{pdf_path.name}: certified PDF date "
                 f"{certified_date.strftime('%m/%d/%Y')}; site card "
                 f"{datetime.datetime.strptime(expected, '%m%d%Y').strftime('%m/%d/%Y')}. "
-                "The certified date is inside the selected range "
-                f"{allowed_date_range[0].isoformat()} through "
-                f"{allowed_date_range[1].isoformat()}.",
+                f"{acceptance_reason}",
             )
             return
         raise NamingError(

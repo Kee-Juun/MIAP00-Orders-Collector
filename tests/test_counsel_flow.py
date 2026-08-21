@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from browser.michigan_counsel import MichiganCounselSite
 from config.settings import Settings
-from core.collector import MIAP00Collector
+from core.collector import MIAP00Collector, select_most_recent_counsel_match
 from core.models import ProcessingRecord
 from core.models import CounselRecord
 
@@ -43,8 +43,16 @@ class CounselFlowTests(unittest.TestCase):
         irt = Mock()
         irt.find_existing_counsel.side_effect = [
             [
-                {"File Name": "LDC_SMD_380275counsel.html", "LNI": "LNI-A"},
-                {"File Name": "LDC_SMD_380275_counsel.htm", "LNI": "LNI-B"},
+                {
+                    "File Name": "LDC_SMD_380275counsel.html",
+                    "LNI": "LNI-A",
+                    "Received Date": "08/12/2026",
+                },
+                {
+                    "File Name": "LDC_SMD_380275_counsel.htm",
+                    "LNI": "LNI-B",
+                    "Received Date": "08/16/2026",
+                },
             ],
             [],
         ]
@@ -65,7 +73,7 @@ class CounselFlowTests(unittest.TestCase):
 
         self.assertEqual(irt.find_existing_counsel.call_count, 2)
         expected = [
-            "380275: LNI-A; LNI-B",
+            "380275: LNI-B",
             "380358: LDC_SMD_380358counsel.html",
         ]
         self.assertEqual(parent.counsel_references, expected)
@@ -94,11 +102,45 @@ class CounselFlowTests(unittest.TestCase):
         )
         self.assertEqual(
             existing.reference(include_docket=False),
-            "LNI-A; LNI-B",
+            "LNI-A",
         )
         self.assertEqual(
             collected.reference(include_docket=True),
             "379218: LDC_SMD_379218counsel.html",
+        )
+
+    def test_most_recent_existing_counsel_uses_received_date(self):
+        matches = [
+            {"LNI": "OLDER", "Received Date": "08/12/2026"},
+            {"LNI": "NEWEST", "Received Date": "08-18-2026"},
+            {"LNI": "MIDDLE", "Received Date": "08/15/2026"},
+        ]
+
+        self.assertEqual(
+            select_most_recent_counsel_match(matches)["LNI"],
+            "NEWEST",
+        )
+
+    def test_most_recent_existing_counsel_falls_back_to_decided_date(self):
+        matches = [
+            {"LNI": "OLDER", "Decided Date": "2026-08-12"},
+            {"LNI": "NEWEST", "Decided Date": "2026-08-18"},
+        ]
+
+        self.assertEqual(
+            select_most_recent_counsel_match(matches)["LNI"],
+            "NEWEST",
+        )
+
+    def test_existing_counsel_date_tie_keeps_first_irt_row(self):
+        matches = [
+            {"LNI": "FIRST", "Received Date": "08/18/2026"},
+            {"LNI": "SECOND", "Received Date": "08/18/2026"},
+        ]
+
+        self.assertEqual(
+            select_most_recent_counsel_match(matches)["LNI"],
+            "FIRST",
         )
 
     def test_compact_counsel_html_contains_only_selected_sections(self):

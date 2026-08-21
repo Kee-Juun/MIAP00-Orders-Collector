@@ -61,7 +61,7 @@ class CounselRecord:
 
     def reference(self, *, include_docket: bool = True) -> str:
         if self.status == "irt_existing":
-            values = "; ".join(self.lnis)
+            values = self.lnis[0] if self.lnis else ""
         elif self.status == "collected":
             values = self.target_filename
         else:

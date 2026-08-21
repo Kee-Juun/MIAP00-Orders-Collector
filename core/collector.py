@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 import logging
 from pathlib import Path
+import re
 import shutil
 import threading
 from typing import Callable
@@ -45,6 +46,42 @@ def collected_counsels_directory_for_run(run_dir: Path) -> Path:
 
 def excluded_directory_for_run(run_dir: Path) -> Path:
     return run_dir / "Excluded"
+
+
+def _irt_record_date(record: dict) -> date:
+    """Return the best available IRT inventory date without guessing from the LNI."""
+
+    for field in ("Received Date", "Decided Date"):
+        value = str(record.get(field, "")).strip()
+        match = re.search(
+            r"(?<!\d)(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})(?!\d)",
+            value,
+        )
+        if not match:
+            continue
+        first, middle, last = (int(part) for part in match.groups())
+        year, month, day = (
+            (first, middle, last) if first >= 1000 else (last, first, middle)
+        )
+        try:
+            return date(year, month, day)
+        except ValueError:
+            continue
+    return date.min
+
+
+def select_most_recent_counsel_match(matches: list[dict]) -> dict:
+    """Select one newest counsel row, preferring rows that expose an LNI."""
+
+    if not matches:
+        return {}
+    with_lni = [match for match in matches if str(match.get("LNI", "")).strip()]
+    candidates = with_lni or matches
+    _, selected = max(
+        enumerate(candidates),
+        key=lambda item: (_irt_record_date(item[1]), -item[0]),
+    )
+    return selected
 
 
 def collected_directory_for_run(run_dir: Path) -> Path:
@@ -251,14 +288,29 @@ class MIAP00Collector:
                 "Collection stopped before IRT duplicate validation",
             )
             if pending:
+                certified_dates = [
+                    datetime.strptime(item.document_date, "%m%d%Y").date()
+                    for item in pending
+                ]
+                irt_start_date = min(start_date, min(certified_dates))
+                irt_end_date = max(end_date, max(certified_dates))
+                if irt_start_date != start_date or irt_end_date != end_date:
+                    self.logger.info(
+                        "IRT snapshot range expanded to cover certified decision dates: "
+                        "%s through %s (user range %s through %s)",
+                        irt_start_date.strftime("%m-%d-%Y"),
+                        irt_end_date.strftime("%m-%d-%Y"),
+                        start_date.strftime("%m-%d-%Y"),
+                        end_date.strftime("%m-%d-%Y"),
+                    )
                 self.logger.info(
                     "IRT bulk duplicate check: capturing %s from %s through %s once",
                     self.settings.irt_court_code,
-                    start_date.strftime("%m-%d-%Y"),
-                    end_date.strftime("%m-%d-%Y"),
+                    irt_start_date.strftime("%m-%d-%Y"),
+                    irt_end_date.strftime("%m-%d-%Y"),
                 )
                 try:
-                    existing = irt.load_existing(start_date, end_date)
+                    existing = irt.load_existing(irt_start_date, irt_end_date)
                 except IRTError as exc:
                     for item in pending:
                         item.path.unlink(missing_ok=True)
@@ -505,7 +557,7 @@ class MIAP00Collector:
         self._ensure_excluded_dir()
         source_path.replace(destination)
         self.logger.warning(
-            "Excluded non-order filing saved for review without renaming: %s (%s)",
+            "Excluded non-order document saved for review without renaming: %s (%s)",
             order.original_filename,
             reason,
         )
@@ -697,26 +749,29 @@ class MIAP00Collector:
             )
             matches = irt_matches[docket]
             if matches:
-                lnis: list[str] = []
-                for match in matches:
-                    lni = str(match.get("LNI", "")).strip()
-                    if lni and lni not in lnis:
-                        lnis.append(lni)
+                selected_match = select_most_recent_counsel_match(matches)
+                selected_lni = str(selected_match.get("LNI", "")).strip()
+                lnis = [selected_lni] if selected_lni else []
                 self.counsel_records.append(
                     CounselRecord(
                         docket=docket,
                         status="irt_existing",
                         lnis=lnis,
-                        irt_evidence=matches,
-                        reason="Matching counsel filename already exists in IRT",
+                        irt_evidence=[selected_match],
+                        reason=(
+                            "Most recent matching counsel filename already exists "
+                            f"in IRT (selected from {len(matches)} match(es))"
+                        ),
                     )
                 )
                 self.logger.info(
-                    "[%d/%d] Counsel recycled from IRT for %s: %s",
+                    "[%d/%d] Counsel recycled from IRT for %s: %s "
+                    "(most recent of %d match(es))",
                     index,
                     total,
                     docket,
-                    ", ".join(lnis) or "LNI unavailable",
+                    selected_lni or "LNI unavailable",
+                    len(matches),
                 )
                 continue
 

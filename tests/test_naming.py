@@ -19,6 +19,9 @@ class NamingTests(unittest.TestCase):
     def test_live_site_order_filename(self):
         self.assertEqual(extract_source_docket("381603_6_01.pdf"), "381603")
 
+    def test_live_site_order_filename_without_part_segment(self):
+        self.assertEqual(extract_source_docket("372786_81.pdf"), "372786")
+
     def test_fileflex_opinion_order_variants(self):
         self.assertEqual(extract_source_docket("20260813_C381603_1_381603.opn_ORDER.pdf"), "381603")
         self.assertEqual(extract_source_docket("20260813_C381603(1)_RPTR_X-381603-ASV..pdf"), "381603")
@@ -105,6 +108,40 @@ class NamingTests(unittest.TestCase):
         footer_ocr.assert_not_called()
         full_ocr.assert_not_called()
 
+    def test_clerk_correspondence_is_excluded_before_ocr(self):
+        letter = (
+            "Michigan Court of Appeals\nOffice of the Clerk\nAugust 18, 2026\n"
+            "Dear Counsel:\nThe publication request that was filed in this matter "
+            "was submitted to the panel that filed the opinion. Please be advised "
+            "that the panel denied the request.\nSincerely,\nJerome W. Zimmer Jr."
+        )
+        with patch("core.naming.extract_pdf_text", return_value=letter), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr"
+        ) as footer_ocr, patch("core.naming.extract_pdf_text_with_ocr") as full_ocr:
+            with self.assertRaisesRegex(NonOrderDocumentError, "clerk correspondence"):
+                extract_document_date(
+                    Path("372786_81.pdf"), expected_date="08/18/2026"
+                )
+
+        footer_ocr.assert_not_called()
+        full_ocr.assert_not_called()
+
+    def test_clerk_cover_letter_does_not_exclude_attached_certified_order(self):
+        body = (
+            "Michigan Court of Appeals\nOffice of the Clerk\nDear Counsel:\n"
+            "Sincerely,\nORDER\nA TRUE COPY ENTERED AND CERTIFIED"
+        )
+        with patch("core.naming.extract_pdf_text", return_value=body), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value="August 18, 2026\nChief Clerk\nDate",
+        ):
+            self.assertEqual(
+                extract_document_date(
+                    Path("cover-and-order.pdf"), expected_date="08/18/2026"
+                ),
+                "08182026",
+            )
+
     def test_received_stamp_does_not_exclude_certified_order(self):
         text = (
             "ORDER\nRECEIVED by MCOA 8/17/2026\n"
@@ -135,15 +172,18 @@ class NamingTests(unittest.TestCase):
         footer_ocr.assert_called_once()
         full_ocr.assert_not_called()
 
-    def test_release_date_disagreement_is_rejected_before_irt(self):
+    def test_certified_footer_date_overrides_release_date_before_irt(self):
+        logger = Mock()
         with patch("core.naming.extract_pdf_text", return_value="ORDER"), patch(
             "core.naming.extract_pdf_footer_text_with_ocr",
             return_value="August 13, 2026\nChief Clerk\nDate",
         ):
-            with self.assertRaisesRegex(NamingError, "does not match source release date"):
-                extract_document_date(
-                    Path("order.pdf"), expected_date="08/12/2026"
-                )
+            result = extract_document_date(
+                Path("order.pdf"), logger=logger, expected_date="08/12/2026"
+            )
+
+        self.assertEqual(result, "08132026")
+        self.assertIn("certification footer controls", logger.warning.call_args.args[0])
 
     def test_certified_date_in_selected_range_overrides_stale_site_date(self):
         logger = Mock()
@@ -162,17 +202,23 @@ class NamingTests(unittest.TestCase):
         logger.warning.assert_called_once()
         self.assertIn("mismatch accepted", logger.warning.call_args.args[0])
 
-    def test_certified_date_outside_selected_range_is_rejected(self):
+    def test_reposted_certified_date_outside_selected_range_is_accepted(self):
+        logger = Mock()
         with patch("core.naming.extract_pdf_text", return_value="ORDER"), patch(
             "core.naming.extract_pdf_footer_text_with_ocr",
-            return_value="August 14, 2026\nChief Clerk\nDate",
+            return_value="July 13, 2026\nChief Clerk\nDate",
         ):
-            with self.assertRaisesRegex(NamingError, "does not match source release date"):
-                extract_document_date(
-                    Path("375536_71_08.pdf"),
-                    expected_date="08/12/2026",
-                    allowed_date_range=(date(2026, 8, 12), date(2026, 8, 13)),
-                )
+            result = extract_document_date(
+                Path("377922_65_02.pdf"),
+                logger=logger,
+                expected_date="08/20/2026",
+                allowed_date_range=(date(2026, 8, 17), date(2026, 8, 21)),
+            )
+
+        self.assertEqual(result, "07132026")
+        warning = logger.warning.call_args.args[0]
+        self.assertIn("older certified order", warning)
+        self.assertIn("certification footer controls", warning)
 
     def test_hearing_dates_are_not_used_without_certification_footer(self):
         text = (
