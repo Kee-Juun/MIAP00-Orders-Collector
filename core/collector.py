@@ -12,6 +12,7 @@ from typing import Callable
 
 from config.settings import Settings
 from .cancellation import CollectionCancelled, raise_if_cancelled
+from .file_ops import replace_file_with_retry
 from .content_duplicates import (
     find_irt_backed_content_duplicates,
     remove_content_duplicates,
@@ -215,7 +216,12 @@ class MIAP00Collector:
                         raise CollectionError(
                             f"Temporary target filename already exists: {target_filename}"
                         )
-                    temp_path.replace(renamed_temp_path)
+                    replace_file_with_retry(
+                        temp_path,
+                        renamed_temp_path,
+                        logger=self.logger,
+                        cancel_event=self.cancel_event,
+                    )
                     temp_path = renamed_temp_path
                     self.logger.info("Renamed temporary PDF: %s", target_filename)
 

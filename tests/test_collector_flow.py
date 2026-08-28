@@ -1,10 +1,12 @@
 from datetime import date
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
+from browser.michigan_courts import MichiganOrdersSite
 from config.settings import Settings
 from core.collector import (
     MIAP00Collector,
@@ -12,12 +14,81 @@ from core.collector import (
     collected_directory_for_run,
     collected_orders_directory_for_run,
     excluded_directory_for_run,
+    replace_file_with_retry,
 )
 from core.models import OrderResult
 from core.naming import sha256_file
 
 
 class CollectorFlowTests(unittest.TestCase):
+    def test_transient_windows_pdf_lock_is_retried_before_rename_failure(self):
+        source = Path("temporary-order.pdf")
+        destination = Path("LDC_SMD_379083_08262026.pdf")
+        locked = PermissionError(13, "file is being used by another process")
+        locked.winerror = 32
+        logger = Mock()
+
+        with patch.object(
+            Path,
+            "replace",
+            side_effect=[locked, destination],
+        ) as replace, patch("core.file_ops.cancellable_wait") as wait:
+            replace_file_with_retry(source, destination, logger=logger)
+
+        self.assertEqual(replace.call_count, 2)
+        wait.assert_called_once()
+        logger.warning.assert_called_once()
+
+    def test_download_finalization_retries_transient_windows_file_lock(self):
+        payload = b"%PDF-transient-lock-test" + (b"0" * 128)
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.iter_content.return_value = [payload]
+        site = MichiganOrdersSite(Settings(), Mock())
+        order = OrderResult(
+            page=1,
+            position=1,
+            docket="380798",
+            title="Test order",
+            lower_court="",
+            release_date="08/26/2026",
+            order_type="Order",
+            pdf_url="https://example.test/380798_16_01.pdf",
+            original_filename="380798_16_01.pdf",
+        )
+        locked = PermissionError(13, "file is being used by another process")
+        locked.winerror = 32
+        attempts = 0
+
+        def replace_after_lock(source, destination):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise locked
+            os.replace(source, destination)
+            return destination
+
+        with TemporaryDirectory() as directory, patch.object(
+            site,
+            "_open_download_response",
+            return_value=response,
+        ), patch.object(
+            Path,
+            "replace",
+            autospec=True,
+            side_effect=replace_after_lock,
+        ), patch(
+            "core.file_ops.cancellable_wait"
+        ) as wait:
+            destination = Path(directory) / "380798_16_01.pdf"
+            byte_count = site.download_pdf(order, destination)
+
+            self.assertEqual(byte_count, len(payload))
+            self.assertEqual(destination.read_bytes(), payload)
+
+        self.assertEqual(attempts, 2)
+        wait.assert_called_once()
+
     def test_collected_files_use_separate_run_named_subfolders(self):
         run_dir = Path("output") / "MIAP00_08-15-2026_18-01-23-355"
         self.assertEqual(

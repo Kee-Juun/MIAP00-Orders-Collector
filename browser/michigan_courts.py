@@ -22,6 +22,7 @@ from core.cancellation import (
     raise_if_cancelled,
 )
 from core.models import OrderResult
+from core.file_ops import replace_file_with_retry
 from .webdriver_factory import (
     cancellable_navigate,
     close_chrome_driver,
@@ -511,7 +512,12 @@ class MichiganOrdersSite:
             raise_if_cancelled(active_cancel_event, "Collection stopped during PDF download")
             if part.stat().st_size < 100 or part.read_bytes()[:5] != b"%PDF-":
                 raise SiteAutomationError(f"Downloaded content is not a valid PDF: {order.pdf_url}")
-            part.replace(destination)
+            replace_file_with_retry(
+                part,
+                destination,
+                logger=self.logger,
+                cancel_event=active_cancel_event,
+            )
             return destination.stat().st_size
         finally:
             part.unlink(missing_ok=True)

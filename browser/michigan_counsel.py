@@ -15,7 +15,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 from config.settings import Settings
-from core.cancellation import CollectionCancelled, raise_if_cancelled
+from core.cancellation import (
+    CollectionCancelled,
+    cancellable_wait,
+    raise_if_cancelled,
+)
 from .michigan_courts import MichiganOrdersSite
 from .webdriver_factory import cancellable_navigate
 
@@ -26,6 +30,9 @@ class CounselCollectionError(RuntimeError):
 
 class MichiganCounselSite:
     """Reuse the Michigan Orders browser to collect one counsel page per docket."""
+
+    CASE_DETAIL_ATTEMPTS = 3
+    CASE_DETAIL_RETRY_DELAY_SECONDS = 1.0
 
     def __init__(
         self,
@@ -102,15 +109,49 @@ class MichiganCounselSite:
                 cancel_event,
                 context=f"Collection stopped while opening counsel case {docket}",
             )
-            self._wait_for_case_content(docket)
-            self._expand_all_parties()
-            payload = self._extract_case_content(docket)
+            try:
+                self._wait_for_case_content(docket)
+                self._expand_all_parties()
+                payload = self._extract_case_content(docket)
+            except CollectionCancelled:
+                raise
+            except Exception as rendered_exc:
+                self.logger.warning(
+                    "Rendered counsel page failed for %s (%s); making one final "
+                    "direct case-detail request",
+                    docket,
+                    rendered_exc,
+                )
+                try:
+                    case_data = self._load_case_detail_data(
+                        docket,
+                        case_url,
+                        attempts=1,
+                    )
+                    payload = self._payload_from_case_data(docket, case_data)
+                    self.logger.info(
+                        "Recovered counsel data from Michigan case-detail service: %s",
+                        docket,
+                    )
+                except CollectionCancelled:
+                    raise
+                except Exception as final_exc:
+                    raise CounselCollectionError(
+                        f"Counsel data could not be loaded for docket {docket} "
+                        "after direct and rendered-page recovery attempts"
+                    ) from final_exc
         html = self._standalone_html(docket, payload)
         destination.write_text(html, encoding="utf-8", newline="\n")
         self.logger.info("Counsel collected: %s", destination.name)
         return case_url
 
-    def _load_case_detail_data(self, docket: str, case_url: str) -> dict:
+    def _load_case_detail_data(
+        self,
+        docket: str,
+        case_url: str,
+        *,
+        attempts: int | None = None,
+    ) -> dict:
         """Load the structured record used by Michigan's case-detail Vue page."""
 
         raise_if_cancelled(self.cancel_event, "Collection stopped before counsel download")
@@ -119,6 +160,7 @@ class MichiganCounselSite:
             f"/c/courts/getcourtofappealscasedetaildata/{quote(docket)}",
         )
         session = requests.Session()
+        attempt_limit = max(1, attempts or self.CASE_DETAIL_ATTEMPTS)
         try:
             for cookie in self.driver.get_cookies():
                 session.cookies.set(
@@ -126,25 +168,47 @@ class MichiganCounselSite:
                     cookie["value"],
                     domain=cookie.get("domain"),
                 )
-            response = session.get(
-                endpoint,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": self.settings.user_agent,
-                    "Referer": case_url,
-                },
-                timeout=(5, min(self.settings.browser_timeout_seconds, 20)),
-            )
-            response.raise_for_status()
-            data = response.json()
-        except requests.RequestException as exc:
-            raise CounselCollectionError(
-                f"Michigan case-detail service failed for docket {docket}"
-            ) from exc
-        except ValueError as exc:
-            raise CounselCollectionError(
-                f"Michigan case-detail service returned invalid data for docket {docket}"
-            ) from exc
+            for attempt in range(1, attempt_limit + 1):
+                raise_if_cancelled(
+                    self.cancel_event,
+                    "Collection stopped before counsel download",
+                )
+                try:
+                    response = session.get(
+                        endpoint,
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": self.settings.user_agent,
+                            "Referer": case_url,
+                        },
+                        timeout=(5, min(self.settings.browser_timeout_seconds, 20)),
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    break
+                except (requests.RequestException, ValueError) as exc:
+                    if attempt >= attempt_limit or not self._retryable_detail_error(exc):
+                        detail = (
+                            "returned invalid data"
+                            if isinstance(exc, ValueError)
+                            else "failed"
+                        )
+                        raise CounselCollectionError(
+                            f"Michigan case-detail service {detail} for docket {docket}"
+                        ) from exc
+                    self.logger.warning(
+                        "Michigan case-detail request %d/%d failed for %s (%s); "
+                        "retrying",
+                        attempt,
+                        attempt_limit,
+                        docket,
+                        exc,
+                    )
+                    cancellable_wait(
+                        self.cancel_event,
+                        self.CASE_DETAIL_RETRY_DELAY_SECONDS * attempt,
+                        f"Collection stopped while retrying counsel docket {docket}",
+                    )
         finally:
             session.close()
 
@@ -168,6 +232,19 @@ class MichiganCounselSite:
                 f"Michigan case-detail service returned a different case for docket {docket}"
             )
         return data
+
+    @staticmethod
+    def _retryable_detail_error(exc: Exception) -> bool:
+        """Return whether another official endpoint request may recover safely."""
+
+        if isinstance(exc, ValueError):
+            return True
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(exc, requests.HTTPError):
+            status = exc.response.status_code if exc.response is not None else 0
+            return status == 429 or status >= 500
+        return False
 
     @staticmethod
     def _payload_from_case_data(docket: str, data: dict) -> dict[str, str]:

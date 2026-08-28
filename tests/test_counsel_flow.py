@@ -4,7 +4,9 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
-from browser.michigan_counsel import MichiganCounselSite
+import requests
+
+from browser.michigan_counsel import CounselCollectionError, MichiganCounselSite
 from config.settings import Settings
 from core.collector import MIAP00Collector, select_most_recent_counsel_match
 from core.models import ProcessingRecord
@@ -317,6 +319,75 @@ class CounselFlowTests(unittest.TestCase):
                 "379218",
                 {"title": "TEST", "courtOfAppealsParties": []},
             )
+
+    def test_case_detail_timeout_is_retried_before_browser_fallback(self):
+        logger = Mock()
+        orders_site = Mock()
+        orders_site.driver.get_cookies.return_value = []
+        counsel_site = MichiganCounselSite(Settings(), logger, orders_site)
+        response = Mock()
+        response.json.return_value = {
+            "id": 386499,
+            "courtOfAppealsCaseNumber": 382083,
+        }
+        session = Mock()
+        session.get.side_effect = [
+            requests.ReadTimeout("temporary timeout"),
+            response,
+        ]
+
+        with patch(
+            "browser.michigan_counsel.requests.Session",
+            return_value=session,
+        ), patch("browser.michigan_counsel.cancellable_wait") as wait:
+            result = counsel_site._load_case_detail_data(
+                "382083",
+                "https://www.courts.michigan.gov/case/382083",
+            )
+
+        self.assertEqual(result["courtOfAppealsCaseNumber"], 382083)
+        self.assertEqual(session.get.call_count, 2)
+        wait.assert_called_once()
+        session.close.assert_called_once()
+
+    def test_rendered_page_timeout_gets_final_direct_recovery_attempt(self):
+        settings = Settings()
+        logger = Mock()
+        orders_site = Mock()
+        counsel_site = MichiganCounselSite(settings, logger, orders_site)
+        field = Mock()
+        search_button = Mock()
+        link = Mock()
+        link.get_attribute.return_value = "https://www.courts.michigan.gov/case/382083"
+        recovered_data = {"id": 386499, "courtOfAppealsCaseNumber": 382083}
+        payload = {"header": "<section></section>", "parties": "<section></section>"}
+
+        with TemporaryDirectory() as directory, patch(
+            "browser.michigan_counsel.cancellable_navigate"
+        ), patch.object(
+            counsel_site, "_open_advanced_search"
+        ), patch.object(
+            counsel_site, "_wait_for_case_number_field", return_value=field
+        ), patch.object(
+            counsel_site, "_search_button_for", return_value=search_button
+        ), patch.object(
+            counsel_site, "_wait", return_value=link
+        ), patch.object(
+            counsel_site,
+            "_load_case_detail_data",
+            side_effect=[CounselCollectionError("timeout"), recovered_data],
+        ) as load, patch.object(
+            counsel_site,
+            "_wait_for_case_content",
+            side_effect=CounselCollectionError("render timeout"),
+        ), patch.object(
+            counsel_site, "_payload_from_case_data", return_value=payload
+        ):
+            destination = Path(directory) / "LDC_SMD_382083counsel.html"
+            counsel_site.collect("382083", destination)
+            self.assertTrue(destination.exists())
+            self.assertEqual(load.call_count, 2)
+            self.assertEqual(load.call_args_list[1].kwargs["attempts"], 1)
 
 
 if __name__ == "__main__":

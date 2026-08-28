@@ -1,5 +1,8 @@
 from datetime import date
 from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,12 +13,37 @@ from core.naming import (
     docket_suffix,
     extract_document_date,
     extract_miap00_date_from_text,
+    extract_pdf_text,
     extract_source_docket,
     normalize_final_key,
 )
 
 
 class NamingTests(unittest.TestCase):
+    def test_pdf_text_stream_is_closed_before_extraction_returns(self):
+        observed = {}
+
+        class FakePage:
+            @staticmethod
+            def extract_text():
+                return "ORDER"
+
+        class FakeReader:
+            def __init__(self, stream):
+                observed["stream"] = stream
+                self.pages = [FakePage()]
+
+        with TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "order.pdf"
+            pdf_path.write_bytes(b"%PDF-test")
+            with patch.dict(
+                sys.modules,
+                {"pypdf": SimpleNamespace(PdfReader=FakeReader)},
+            ):
+                self.assertEqual(extract_pdf_text(pdf_path), "ORDER")
+
+        self.assertTrue(observed["stream"].closed)
+
     def test_live_site_order_filename(self):
         self.assertEqual(extract_source_docket("381603_6_01.pdf"), "381603")
 
@@ -107,6 +135,36 @@ class NamingTests(unittest.TestCase):
 
         footer_ocr.assert_not_called()
         full_ocr.assert_not_called()
+
+    def test_event_reference_placeholder_is_excluded_before_ocr(self):
+        for placeholder in ("See event 39", "\n  See   event 35.  \n"):
+            with self.subTest(placeholder=placeholder), patch(
+                "core.naming.extract_pdf_text", return_value=placeholder
+            ), patch(
+                "core.naming.extract_pdf_footer_text_with_ocr"
+            ) as footer_ocr, patch(
+                "core.naming.extract_pdf_text_with_ocr"
+            ) as full_ocr:
+                with self.assertRaisesRegex(
+                    NonOrderDocumentError, "event-reference placeholder"
+                ):
+                    extract_document_date(Path("placeholder.pdf"))
+
+                footer_ocr.assert_not_called()
+                full_ocr.assert_not_called()
+
+    def test_order_that_mentions_event_reference_is_not_excluded(self):
+        body = "ORDER\nFor supporting materials, see event 39."
+        with patch("core.naming.extract_pdf_text", return_value=body), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value="August 28, 2026\nChief Clerk\nDate",
+        ) as footer_ocr:
+            result = extract_document_date(
+                Path("order.pdf"), expected_date="08/28/2026"
+            )
+
+        self.assertEqual(result, "08282026")
+        footer_ocr.assert_called_once()
 
     def test_clerk_correspondence_is_excluded_before_ocr(self):
         letter = (

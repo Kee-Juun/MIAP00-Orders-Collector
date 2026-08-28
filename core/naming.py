@@ -30,6 +30,7 @@ _FINAL_NAME_PATTERN = re.compile(
     r"LDC_SMD_(?P<docket>\d+)(?P<suffix>[a-z]*)_(?P<date>\d{8})\.pdf",
     re.IGNORECASE,
 )
+_EVENT_REFERENCE_PLACEHOLDER_PATTERN = re.compile(r"SEE EVENT \d+\.?$")
 
 
 class NamingError(ValueError):
@@ -95,6 +96,11 @@ def extract_document_date(
         logger=logger,
         cancel_event=cancel_event,
     )
+    if _looks_like_event_reference_placeholder(text):
+        raise NonOrderDocumentError(
+            "Michigan Orders search returned an event-reference placeholder, "
+            f"not a certified court order: {pdf_path.name}"
+        )
     if _looks_like_non_order_clerk_correspondence(text):
         raise NonOrderDocumentError(
             f"Michigan Orders search returned clerk correspondence, not a "
@@ -181,6 +187,11 @@ def _looks_like_non_order_clerk_correspondence(text: str) -> bool:
         and "DEAR COUNSEL" in normalized
         and "SINCERELY" in normalized
     )
+
+
+def _looks_like_event_reference_placeholder(text: str) -> bool:
+    """Recognize an otherwise empty ``See event N`` placeholder document."""
+    return bool(_EVENT_REFERENCE_PLACEHOLDER_PATTERN.fullmatch(_normalize_line(text)))
 
 
 def _looks_like_received_party_filing(text: str) -> bool:
@@ -398,12 +409,21 @@ def extract_pdf_text(
         from pypdf import PdfReader
 
         raise_if_cancelled(cancel_event)
-        reader = PdfReader(str(pdf_path))
-        texts: list[str] = []
-        for page in list(reader.pages)[:max_pages]:
-            raise_if_cancelled(cancel_event, "Collection stopped while reading PDF text")
-            texts.append(page.extract_text() or "")
-        return "\n".join(texts)
+        # Passing a path directly lets PdfReader own a lazy file stream whose
+        # lifetime can extend until garbage collection. On Windows that can
+        # briefly lock the downloaded PDF and make the immediate FileFlex
+        # rename fail with WinError 32. Own the stream here and close it
+        # deterministically before returning to the collector.
+        with pdf_path.open("rb") as pdf_stream:
+            reader = PdfReader(pdf_stream)
+            texts: list[str] = []
+            for page in list(reader.pages)[:max_pages]:
+                raise_if_cancelled(
+                    cancel_event,
+                    "Collection stopped while reading PDF text",
+                )
+                texts.append(page.extract_text() or "")
+            return "\n".join(texts)
     except CollectionCancelled:
         raise
     except Exception as exc:
