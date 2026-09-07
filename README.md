@@ -18,7 +18,7 @@ Desktop and CLI automation for collecting Michigan Court of Appeals PDF orders f
 12. Uses exact IRT matches as online parent copies and excludes exact-content same-docket suffix copies before the parent is discarded. It also excludes high-confidence consolidated siblings when their appellate docket sets and normalized PDF content match.
 13. Performs a post-download content check, keeping the first copy while removing true duplicates and high-confidence consolidated copies; every consolidated docket is preserved on the canonical parent record.
 14. Searches IRT under `STMIAP00` once per unique retained docket with `*<docket>*counsel*`. Existing counsel files are recycled by LNI. For a missing counsel, the collector returns to Case Search, opens Advanced Search, locates the Case Number input through its stable fieldset legend, waits for the reactive Search button to enable, and collects the case page as `LDC_SMD_<docket>counsel.html`.
-15. Moves accepted PDFs and new counsel HTML into the run's `Collected_<run-folder-name>` subfolder, then writes an Excel report and background log named after that run folder.
+15. Moves accepted PDFs and new counsel HTML into their run-named subfolders, then writes the detailed Excel report, a standalone release-date filenames workbook, and the background log.
 
 ## Verified live selectors (August 14, 2026)
 
@@ -143,8 +143,10 @@ Each run creates:
 Downloads/MIAP00 Orders Collections/MIAP00_MM-DD-YYYY_HH-MM-SS-ms/
   Log_MIAP00_MM-DD-YYYY_HH-MM-SS-ms.log
   Report_MIAP00_MM-DD-YYYY_HH-MM-SS-ms.xlsx
-  Collected_MIAP00_MM-DD-YYYY_HH-MM-SS-ms/
+  MIAP00 MMDDYYYY Release Date Filenames.xlsx
+  Collected_Orders_MIAP00_MM-DD-YYYY_HH-MM-SS-ms/
     LDC_SMD_<docket>_<MMDDYYYY>.pdf
+  Collected_Counsels_MIAP00_MM-DD-YYYY_HH-MM-SS-ms/
     LDC_SMD_<docket>counsel.html
 ```
 
@@ -154,7 +156,7 @@ Order filenames use the certified decision date read from the rendered footer. T
 
 The one IRT snapshot waits for a browser-observed Ajax/DOM refresh tied to that Search click; elapsed time alone can never validate the result table. The start and end dates are entered with the same input/change/blur events used by the working PLR000-CCA001 workflow, and the collector fails closed if the captured row count is smaller than IRT's displayed result count.
 
-The workbook includes Summary, Filenames, Collected, Duplicates, Counsel, Errors, and Discovered sheets. Filenames pairs each successfully collected main-document filename with its counsel references. A newly collected counsel is shown by filename; an existing IRT counsel is shown by its most recent received-date LNI when multiple users uploaded counsel for the same docket. Consolidated dockets are grouped on the canonical parent row, while a retained trailing-letter sibling receives its own row with the same reused docket references. Duplicate rows preserve the IRT LNI, stored filename, decided/received dates, route, source detail, and post-run content-duplicate reason where applicable.
+The detailed workbook includes Summary, Filenames, Collected, Duplicates, Counsel, Errors, and Discovered sheets. Filenames pairs each successfully collected main-document filename with its counsel references. The companion `MIAP00 MMDDYYYY Release Date Filenames.xlsx` workbook repeats that final two-column mapping on its `ORDERS` sheet and uses the majority certified decision date of the collected orders in its filename (latest date wins a tie). A newly collected counsel is shown by filename; an existing IRT counsel is shown by its most recent received-date LNI when multiple users uploaded counsel for the same docket. Consolidated dockets are grouped on the canonical parent row, while a retained trailing-letter sibling receives its own row with the same reused docket references. Duplicate rows preserve the IRT LNI, stored filename, decided/received dates, route, source detail, and post-run content-duplicate reason where applicable.
 
 ## Operational notes
 

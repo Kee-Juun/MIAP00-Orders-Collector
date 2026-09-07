@@ -101,6 +101,11 @@ def extract_document_date(
             "Michigan Orders search returned an event-reference placeholder, "
             f"not a certified court order: {pdf_path.name}"
         )
+    if _looks_like_consolidated_cases_policy(text):
+        raise NonOrderDocumentError(
+            "Michigan Orders search returned the Clerk's Office consolidated-cases "
+            f"policy handout, not a certified court order: {pdf_path.name}"
+        )
     if _looks_like_non_order_clerk_correspondence(text):
         raise NonOrderDocumentError(
             f"Michigan Orders search returned clerk correspondence, not a "
@@ -192,6 +197,31 @@ def _looks_like_non_order_clerk_correspondence(text: str) -> bool:
 def _looks_like_event_reference_placeholder(text: str) -> bool:
     """Recognize an otherwise empty ``See event N`` placeholder document."""
     return bool(_EVENT_REFERENCE_PLACEHOLDER_PATTERN.fullmatch(_normalize_line(text)))
+
+
+def _looks_like_consolidated_cases_policy(text: str) -> bool:
+    """Recognize the Clerk's informational consolidation-policy attachment."""
+
+    if not text.strip():
+        return False
+    normalized = _normalize_line(text)
+    lines = [_normalize_line(line) for line in text.splitlines() if line.strip()]
+    has_order_heading = any(
+        re.fullmatch(r"(?:AMENDED |CORRECTED )?ORDER", line)
+        for line in lines[:160]
+    )
+    if has_order_heading or "A TRUE COPY ENTERED AND CERTIFIED" in normalized:
+        return False
+    return all(
+        marker in normalized
+        for marker in (
+            "MICHIGAN COURT OF APPEALS",
+            "OFFICE OF THE CLERK",
+            "POLICY ON CONSOLIDATED CASES",
+            "THE ENCLOSED ORDER CONSOLIDATES THE NOTED APPEALS",
+            "THIS STATEMENT EXPLAINS THE EFFECT OF CONSOLIDATION",
+        )
+    )
 
 
 def _looks_like_received_party_filing(text: str) -> bool:
@@ -512,7 +542,14 @@ def extract_pdf_footer_text_with_ocr(
                     matrix=fitz.Matrix(2, 2), clip=clip, alpha=False
                 )
                 image = Image.open(io.BytesIO(pixmap.tobytes("png")))
-                texts.append(_ocr_image(image, tesseract, cancel_event))
+                texts.append(
+                    _ocr_footer_image(
+                        image,
+                        tesseract,
+                        logger=logger,
+                        cancel_event=cancel_event,
+                    )
+                )
         return "\n".join(texts)
     except CollectionCancelled:
         raise
@@ -521,7 +558,40 @@ def extract_pdf_footer_text_with_ocr(
         return ""
 
 
-def _ocr_image(image, tesseract: str, cancel_event=None) -> str:
+def _ocr_footer_image(
+    image,
+    tesseract: str,
+    *,
+    logger=None,
+    cancel_event=None,
+) -> str:
+    """Retry a sparse certification footer with a suitable layout mode."""
+
+    primary_text = _ocr_image(image, tesseract, cancel_event)
+    if _extract_order_date(primary_text):
+        return primary_text
+
+    _log(
+        logger,
+        "info",
+        "Default footer OCR found no certified date; retrying sparse footer layout",
+    )
+    sparse_text = _ocr_image(
+        image,
+        tesseract,
+        cancel_event,
+        page_segmentation_mode=6,
+    )
+    return "\n".join(text for text in (primary_text, sparse_text) if text)
+
+
+def _ocr_image(
+    image,
+    tesseract: str,
+    cancel_event=None,
+    *,
+    page_segmentation_mode: int | None = None,
+) -> str:
     """Run one Tesseract process that can be terminated by the Stop button."""
 
     raise_if_cancelled(cancel_event, "Collection stopped before OCR")
@@ -532,8 +602,11 @@ def _ocr_image(image, tesseract: str, cancel_event=None) -> str:
     try:
         image.save(image_path, format="PNG")
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        command = [tesseract, str(image_path), "stdout", "-l", "eng"]
+        if page_segmentation_mode is not None:
+            command.extend(["--psm", str(page_segmentation_mode)])
         process = subprocess.Popen(
-            [tesseract, str(image_path), "stdout", "-l", "eng"],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 from openpyxl import Workbook
@@ -14,6 +16,45 @@ from core.models import CounselRecord, OrderResult, ProcessingRecord
 
 def report_path_for_run(run_dir: Path) -> Path:
     return run_dir / f"Report_{run_dir.name}.xlsx"
+
+
+FINAL_ORDER_DATE_RE = re.compile(r"_(\d{8})\.pdf$", re.IGNORECASE)
+
+
+def dominant_collected_document_date(
+    records: list[ProcessingRecord],
+) -> str | None:
+    """Return the most common certified date, preferring the latest on a tie."""
+
+    dates: list[str] = []
+    for record in records:
+        if record.status != "collected" or not record.target_filename:
+            continue
+        value = record.document_date.strip()
+        if not value:
+            match = FINAL_ORDER_DATE_RE.search(record.target_filename)
+            value = match.group(1) if match else ""
+        try:
+            datetime.strptime(value, "%m%d%Y")
+        except (TypeError, ValueError):
+            continue
+        dates.append(value)
+    if not dates:
+        return None
+    counts = Counter(dates)
+    highest_count = max(counts.values())
+    tied = [value for value, count in counts.items() if count == highest_count]
+    return max(tied, key=lambda value: datetime.strptime(value, "%m%d%Y"))
+
+
+def release_filenames_path_for_run(
+    run_dir: Path,
+    records: list[ProcessingRecord],
+) -> Path | None:
+    document_date = dominant_collected_document_date(records)
+    if document_date is None:
+        return None
+    return run_dir / f"MIAP00 {document_date} Release Date Filenames.xlsx"
 
 
 class ReportWriter:
@@ -86,12 +127,43 @@ class ReportWriter:
         self._add_records_sheet(workbook, "Discovered", [row.as_dict() for row in discovered])
         workbook.save(report_path)
         self.logger.info("Report saved: %s", report_path.name)
+        release_path = self._write_release_filenames_workbook(records)
+        if release_path is None:
+            self.logger.info(
+                "Release-date filenames workbook not created: no collected orders"
+            )
+        else:
+            self.logger.info(
+                "Release-date filenames workbook saved: %s",
+                release_path.name,
+            )
         return report_path
+
+    def _write_release_filenames_workbook(
+        self,
+        records: list[ProcessingRecord],
+    ) -> Path | None:
+        release_path = release_filenames_path_for_run(self.run_dir, records)
+        if release_path is None:
+            return None
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "ORDERS"
+        self._populate_filenames_sheet(sheet, records)
+        workbook.save(release_path)
+        return release_path
 
     def _add_filenames_sheet(
         self, workbook, records: list[ProcessingRecord]
     ) -> None:
         sheet = workbook.create_sheet("Filenames")
+        self._populate_filenames_sheet(sheet, records)
+
+    def _populate_filenames_sheet(
+        self,
+        sheet,
+        records: list[ProcessingRecord],
+    ) -> None:
         sheet.append(["Main Document Filename", "Counsel Filename / Recycled LNI"])
         for record in records:
             if record.status == "collected" and record.target_filename:

@@ -16,10 +16,34 @@ from core.naming import (
     extract_pdf_text,
     extract_source_docket,
     normalize_final_key,
+    _extract_order_date,
+    _ocr_footer_image,
 )
 
 
 class NamingTests(unittest.TestCase):
+    def test_sparse_footer_ocr_retries_with_uniform_block_layout(self):
+        recovered = (
+            "A true copy entered and certified by Jerome W. Zimmer Jr., "
+            "Chief Clerk, on\nAugust 28, 2026\nDate\nChief Clerk"
+        )
+        logger = Mock()
+
+        with patch(
+            "core.naming._ocr_image",
+            side_effect=["", recovered],
+        ) as ocr:
+            result = _ocr_footer_image(Mock(), "tesseract", logger=logger)
+
+        self.assertEqual(_extract_order_date(result), "08282026")
+        self.assertEqual(ocr.call_count, 2)
+        self.assertIsNone(ocr.call_args_list[0].kwargs.get("page_segmentation_mode"))
+        self.assertEqual(
+            ocr.call_args_list[1].kwargs["page_segmentation_mode"],
+            6,
+        )
+        self.assertIn("sparse footer layout", logger.info.call_args.args[0])
+
     def test_pdf_text_stream_is_closed_before_extraction_returns(self):
         observed = {}
 
@@ -152,6 +176,47 @@ class NamingTests(unittest.TestCase):
 
                 footer_ocr.assert_not_called()
                 full_ocr.assert_not_called()
+
+    def test_consolidated_cases_policy_handout_is_excluded_before_ocr(self):
+        handout = (
+            "Michigan Court of Appeals\nOffice of the Clerk\n"
+            "POLICY ON CONSOLIDATED CASES\n"
+            "The enclosed order consolidates the noted appeals. This statement "
+            "explains the effect of consolidation on the appellate process.\n"
+            "FILING DEADLINES regarding transcripts, motions or briefs will not "
+            "be affected by the consolidation."
+        )
+        with patch("core.naming.extract_pdf_text", return_value=handout), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr"
+        ) as footer_ocr, patch("core.naming.extract_pdf_text_with_ocr") as full_ocr:
+            with self.assertRaisesRegex(
+                NonOrderDocumentError, "consolidated-cases policy handout"
+            ):
+                extract_document_date(
+                    Path("376940_40_02.pdf"), expected_date="09/01/2026"
+                )
+
+        footer_ocr.assert_not_called()
+        full_ocr.assert_not_called()
+
+    def test_certified_order_with_consolidation_policy_reference_is_not_excluded(self):
+        body = (
+            "Michigan Court of Appeals\nOffice of the Clerk\nORDER\n"
+            "The cases are consolidated. See the POLICY ON CONSOLIDATED CASES.\n"
+            "The enclosed order consolidates the noted appeals. This statement "
+            "explains the effect of consolidation.\n"
+            "A TRUE COPY ENTERED AND CERTIFIED"
+        )
+        with patch("core.naming.extract_pdf_text", return_value=body), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value="September 1, 2026\nChief Clerk\nDate",
+        ):
+            self.assertEqual(
+                extract_document_date(
+                    Path("consolidated-order.pdf"), expected_date="09/01/2026"
+                ),
+                "09012026",
+            )
 
     def test_order_that_mentions_event_reference_is_not_excluded(self):
         body = "ORDER\nFor supporting materials, see event 39."
