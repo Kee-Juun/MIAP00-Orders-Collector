@@ -1,7 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
-import tempfile
-
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('ui\\assets', 'ui\\assets')]
@@ -66,10 +63,10 @@ exe = EXE(
     strip=False,
     upx=False,
     upx_exclude=[],
-    runtime_tmpdir=os.path.join(
-        os.environ.get('LOCALAPPDATA', tempfile.gettempdir()),
-        'MIAP00Runtime',
-    ),
+    # None makes the bootloader resolve the current Windows user's temporary
+    # directory at launch. Do not evaluate LOCALAPPDATA here: spec files run on
+    # the build machine, which would embed the builder's user profile path.
+    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
