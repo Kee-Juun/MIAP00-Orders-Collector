@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
+from utils.packaging import filter_portable_binaries
+
 datas = [('ui\\assets', 'ui\\assets')]
 binaries = []
 hiddenimports = ['pytesseract', 'fitz', 'PIL.Image', 'pypdf']
@@ -49,6 +51,10 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# A developer shell can add private native runtimes to PATH. PyInstaller may
+# mistake their Windows API forwarders and C runtime for application DLLs,
+# causing QtCore to load incompatible procedures on another computer.
+a.binaries = filter_portable_binaries(a.binaries)
 pyz = PYZ(a.pure)
 
 exe = EXE(
