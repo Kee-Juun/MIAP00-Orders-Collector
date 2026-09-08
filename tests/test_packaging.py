@@ -15,6 +15,16 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn("MIAP00Runtime", spec_text)
         self.assertNotIn("os.environ.get('LOCALAPPDATA'", spec_text)
 
+    def test_tesseract_runtime_is_required_and_bundled(self):
+        project_root = Path(__file__).resolve().parents[1]
+        spec_text = (project_root / "MIAP00 Orders Collector.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("MIAP00_TESSERACT_ROOT", spec_text)
+        self.assertIn("eng.traineddata", spec_text)
+        self.assertIn("(str(TESSERACT_ROOT), 'Tesseract-OCR')", spec_text)
+
     def test_windows_api_forwarders_and_system_ucrt_are_not_bundled(self):
         self.assertTrue(
             is_nonportable_binary(

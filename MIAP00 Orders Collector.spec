@@ -1,9 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
 from utils.packaging import filter_portable_binaries
 
-datas = [('ui\\assets', 'ui\\assets')]
+TESSERACT_ROOT = Path(
+    os.environ.get("MIAP00_TESSERACT_ROOT", r"C:\Program Files\Tesseract-OCR")
+)
+for required_path in (
+    TESSERACT_ROOT / "tesseract.exe",
+    TESSERACT_ROOT / "tessdata" / "eng.traineddata",
+):
+    if not required_path.is_file():
+        raise FileNotFoundError(
+            f"Required bundled OCR file is missing: {required_path}"
+        )
+
+datas = [
+    ('ui\\assets', 'ui\\assets'),
+    (str(TESSERACT_ROOT), 'Tesseract-OCR'),
+]
 binaries = []
 hiddenimports = ['pytesseract', 'fitz', 'PIL.Image', 'pypdf']
 tmp_ret = collect_all('selenium')

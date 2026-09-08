@@ -95,7 +95,7 @@ python main.py
 
 Chrome is controlled by Selenium Manager. If the workstation is offline, put the compatible driver path in `chromedriver_path`.
 
-Tesseract is optional only when embedded PDF text contains a usable date. Install Tesseract OCR or set `MIAP00_TESSERACT_PATH` for scanned/image PDFs.
+The packaged Windows EXE includes Tesseract OCR and its English language data for scanned/image PDFs. Source runs use `MIAP00_TESSERACT_PATH`, `TESSERACT_CMD`, `PATH`, or the standard Windows Tesseract installation folders. The PyInstaller build requires `C:\Program Files\Tesseract-OCR` by default; set `MIAP00_TESSERACT_ROOT` to use a different build-time runtime folder. Run the EXE with `--verify-ocr` to verify the bundled engine before distribution.
 
 ## IRT production check
 

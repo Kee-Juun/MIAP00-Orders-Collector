@@ -16,12 +16,50 @@ from core.naming import (
     extract_pdf_text,
     extract_source_docket,
     normalize_final_key,
+    verify_tesseract,
+    _find_tesseract,
     _extract_order_date,
     _ocr_footer_image,
 )
 
 
 class NamingTests(unittest.TestCase):
+    def test_frozen_runtime_tesseract_is_preferred(self):
+        with TemporaryDirectory() as directory:
+            executable = Path(directory) / "Tesseract-OCR" / "tesseract.exe"
+            executable.parent.mkdir()
+            executable.touch()
+            with patch.object(sys, "_MEIPASS", directory, create=True):
+                self.assertEqual(_find_tesseract(), str(executable))
+
+    def test_tesseract_verification_requires_english_language_data(self):
+        with TemporaryDirectory() as directory:
+            executable = Path(directory) / "tesseract.exe"
+            executable.touch()
+            with patch("core.naming._find_tesseract", return_value=str(executable)):
+                available, details = verify_tesseract()
+
+        self.assertFalse(available)
+        self.assertIn("eng.traineddata", details)
+
+    def test_tesseract_verification_launches_resolved_engine(self):
+        with TemporaryDirectory() as directory:
+            executable = Path(directory) / "tesseract.exe"
+            executable.touch()
+            tessdata = Path(directory) / "tessdata"
+            tessdata.mkdir()
+            (tessdata / "eng.traineddata").touch()
+            completed = SimpleNamespace(returncode=0, stdout="tesseract 5.5.0\n", stderr="")
+            with patch("core.naming._find_tesseract", return_value=str(executable)), patch(
+                "core.naming.subprocess.run", return_value=completed
+            ) as run:
+                available, details = verify_tesseract()
+
+        self.assertTrue(available)
+        self.assertIn("tesseract 5.5.0", details)
+        self.assertEqual(run.call_args.args[0], [str(executable), "--version"])
+        self.assertEqual(run.call_args.kwargs["env"]["TESSDATA_PREFIX"], str(tessdata))
+
     def test_sparse_footer_ocr_retries_with_uniform_block_layout(self):
         recovered = (
             "A true copy entered and certified by Jerome W. Zimmer Jr., "

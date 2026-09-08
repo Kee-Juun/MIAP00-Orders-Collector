@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 from .cancellation import CollectionCancelled, raise_if_cancelled
@@ -641,8 +642,21 @@ def _ocr_image(
         image_path.unlink(missing_ok=True)
 
 
+def _bundled_tesseract_candidates(
+    root: str | os.PathLike | None,
+) -> tuple[Path, ...]:
+    if not root:
+        return ()
+    bundled_root = Path(root)
+    return (
+        bundled_root / "Tesseract-OCR" / "tesseract.exe",
+        bundled_root / "tesseract" / "tesseract.exe",
+    )
+
+
 def _find_tesseract() -> str:
     candidates = (
+        *_bundled_tesseract_candidates(getattr(sys, "_MEIPASS", None)),
         os.environ.get("MIAP00_TESSERACT_PATH"),
         os.environ.get("FILEFLEX_TESSERACT_PATH"),
         os.environ.get("TESSERACT_CMD"),
@@ -654,6 +668,39 @@ def _find_tesseract() -> str:
         if candidate and Path(candidate).is_file():
             return str(Path(candidate))
     return ""
+
+
+def verify_tesseract() -> tuple[bool, str]:
+    """Confirm the resolved OCR engine and English language data are usable."""
+
+    tesseract = _find_tesseract()
+    if not tesseract:
+        return False, "Tesseract executable was not found"
+    tessdata = Path(tesseract).resolve().parent / "tessdata"
+    english_data = tessdata / "eng.traineddata"
+    if not english_data.is_file():
+        return False, f"English OCR language data was not found: {english_data}"
+    environment = os.environ.copy()
+    environment["TESSDATA_PREFIX"] = str(tessdata)
+    try:
+        result = subprocess.run(
+            [tesseract, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=environment,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"Tesseract could not start: {exc}"
+    if result.returncode:
+        details = " ".join((result.stderr or result.stdout or "").split())
+        return False, f"Tesseract exited with code {result.returncode}: {details}"
+    version = next(iter((result.stdout or "").splitlines()), "version unknown")
+    return True, f"{version} ({tesseract})"
 
 
 def sha256_file(path: Path) -> str:

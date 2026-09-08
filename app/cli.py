@@ -9,6 +9,7 @@ import sys
 
 from config.settings import Settings
 from core.collector import MIAP00Collector
+from core.naming import verify_tesseract
 from ui.main_window import launch
 
 
@@ -30,11 +31,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run Chrome without visible windows",
     )
+    parser.add_argument(
+        "--verify-ocr",
+        action="store_true",
+        help="Verify the packaged Tesseract OCR runtime and exit",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.verify_ocr:
+        available, details = verify_tesseract()
+        print(f"OCR {'ready' if available else 'unavailable'}: {details}")
+        return 0 if available else 1
     settings = Settings.load(args.config)
     if args.max_pages is not None:
         settings = replace(settings, max_pages=max(0, args.max_pages))
