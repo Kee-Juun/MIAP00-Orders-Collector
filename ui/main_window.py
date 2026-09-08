@@ -263,6 +263,28 @@ def format_outcome_summary(
     )
 
 
+def classify_completed_run(counts: Mapping[str, int]) -> tuple[str, str]:
+    """Classify a non-cancelled run from its final artifact and error counts."""
+
+    collected = int(counts.get("collected", 0)) + int(
+        counts.get("counsel_collected", 0)
+    )
+    errors = int(counts.get("error", 0))
+    if errors:
+        if collected:
+            return (
+                "partial",
+                "Some files were collected, but the run encountered errors.",
+            )
+        return (
+            "failed",
+            "No files were collected because the run encountered errors.",
+        )
+    if collected == 0:
+        return "empty", "No new files were collected."
+    return "completed", "Collection finished."
+
+
 class ThemedMessageDialog(QDialog):
     """Frameless, modal message dialog aligned with the MIAP00 UI theme."""
 
@@ -595,12 +617,16 @@ class CollectionWorker(QObject):
         )
         try:
             run_dir = collector.run()
-            outcome = "cancelled" if collector.was_cancelled else "completed"
+            counts = dict(collector.last_counts)
+            if collector.was_cancelled:
+                outcome, message = "cancelled", "Collection stopped"
+            else:
+                outcome, message = classify_completed_run(counts)
             self.finished.emit(
                 outcome,
                 run_dir,
-                "Collection stopped" if collector.was_cancelled else "Collection finished",
-                dict(collector.last_counts),
+                message,
+                counts,
             )
         except Exception as exc:
             self.finished.emit(
@@ -899,6 +925,8 @@ class CollectorWindow(QMainWindow):
     ) -> None:
         cancelled = outcome == "cancelled"
         success = outcome == "completed"
+        empty = outcome == "empty"
+        partial = outcome == "partial"
         if run_dir:
             self.last_run_dir = Path(run_dir)
             self.open_button.setEnabled(True)
@@ -907,7 +935,15 @@ class CollectorWindow(QMainWindow):
         if success and not cancelled:
             self.progress_bar.setValue(self.progress_bar.maximum())
         self._set_status(
-            "Stopped safely" if cancelled else "Complete" if success else "Stopped with errors"
+            "Stopped safely"
+            if cancelled
+            else "Complete"
+            if success
+            else "No new files"
+            if empty
+            else "Completed with errors"
+            if partial
+            else "Unsuccessful"
         )
         self._set_running(False)
         summary = format_outcome_summary(
@@ -927,6 +963,20 @@ class CollectorWindow(QMainWindow):
                 "Collection complete",
                 f"Collection finished.\n\n{summary}",
                 kind="success",
+            )
+        elif empty:
+            acknowledged = show_themed_message(
+                self,
+                "No new files",
+                f"No new files were collected.\n\n{summary}",
+                kind="info",
+            )
+        elif partial:
+            acknowledged = show_themed_message(
+                self,
+                "Collection completed with errors",
+                f"{message}\n\n{summary}",
+                kind="warning",
             )
         else:
             acknowledged = show_themed_message(

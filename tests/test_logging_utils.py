@@ -9,6 +9,7 @@ from ui.main_window import (
     CollectionWorker,
     CollectorWindow,
     checkbox_checkmark_path,
+    classify_completed_run,
     format_outcome_summary,
     friendly_status,
 )
@@ -117,6 +118,44 @@ class LoggingFormatTests(unittest.TestCase):
         self.assertEqual(emitted[0][0], "cancelled")
         self.assertEqual(emitted[0][2], "Collection stopped")
 
+    def test_completed_run_with_no_new_files_is_not_success(self):
+        self.assertEqual(
+            classify_completed_run(
+                {"collected": 0, "counsel_collected": 0, "duplicate": 12}
+            ),
+            ("empty", "No new files were collected."),
+        )
+
+    def test_completed_run_with_only_errors_is_unsuccessful(self):
+        self.assertEqual(
+            classify_completed_run(
+                {"collected": 0, "counsel_collected": 0, "error": 3}
+            ),
+            (
+                "failed",
+                "No files were collected because the run encountered errors.",
+            ),
+        )
+
+    def test_completed_run_with_files_and_errors_is_partial(self):
+        self.assertEqual(
+            classify_completed_run(
+                {"collected": 4, "counsel_collected": 2, "error": 1}
+            ),
+            (
+                "partial",
+                "Some files were collected, but the run encountered errors.",
+            ),
+        )
+
+    def test_completed_run_with_files_and_no_errors_is_success(self):
+        self.assertEqual(
+            classify_completed_run(
+                {"collected": 4, "counsel_collected": 2, "error": 0}
+            ),
+            ("completed", "Collection finished."),
+        )
+
     def test_cancelled_outcome_dialog_is_stopped_without_fake_error(self):
         window = Mock()
         window.last_run_dir = None
@@ -137,6 +176,45 @@ class LoggingFormatTests(unittest.TestCase):
         self.assertIn("Errors: 0", show_message.call_args.args[2])
         self.assertIn("Orders collected: 0", show_message.call_args.args[2])
         self.assertIn("Counsels collected: 0", show_message.call_args.args[2])
+
+    def test_empty_outcome_dialog_does_not_claim_success(self):
+        window = Mock()
+        window.last_run_dir = None
+        window.progress_bar.maximum.return_value = 100
+
+        with unittest.mock.patch(
+            "ui.main_window.show_themed_message", return_value=False
+        ) as show_message:
+            CollectorWindow._finished(
+                window,
+                "empty",
+                None,
+                "No new files were collected.",
+                {"collected": 0, "counsel_collected": 0, "duplicate": 8},
+            )
+
+        self.assertEqual(show_message.call_args.args[1], "No new files")
+        self.assertEqual(show_message.call_args.kwargs["kind"], "info")
+        self.assertNotIn("Collection finished", show_message.call_args.args[2])
+
+    def test_zero_collection_error_dialog_is_unsuccessful(self):
+        window = Mock()
+        window.last_run_dir = None
+        window.progress_bar.maximum.return_value = 100
+
+        with unittest.mock.patch(
+            "ui.main_window.show_themed_message", return_value=False
+        ) as show_message:
+            CollectorWindow._finished(
+                window,
+                "failed",
+                None,
+                "No files were collected because the run encountered errors.",
+                {"collected": 0, "counsel_collected": 0, "error": 2},
+            )
+
+        self.assertEqual(show_message.call_args.args[1], "Collection failed")
+        self.assertEqual(show_message.call_args.kwargs["kind"], "error")
 
     def test_outcome_summary_combines_all_excluded_statuses(self):
         summary = format_outcome_summary(
