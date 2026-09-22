@@ -8,7 +8,7 @@ import re
 from typing import Any, Iterable
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from core.models import CounselRecord, OrderResult, ProcessingRecord
@@ -60,6 +60,13 @@ def release_filenames_path_for_run(
 class ReportWriter:
     HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
     HEADER_FONT = Font(color="FFFFFF", bold=True)
+    TABLE_BORDER_SIDE = Side(style="thin", color="808080")
+    TABLE_BORDER = Border(
+        left=TABLE_BORDER_SIDE,
+        right=TABLE_BORDER_SIDE,
+        top=TABLE_BORDER_SIDE,
+        bottom=TABLE_BORDER_SIDE,
+    )
 
     def __init__(self, run_dir: Path, logger):
         self.run_dir = run_dir
@@ -96,6 +103,10 @@ class ReportWriter:
             ("Local duplicates skipped", counts.get("local_duplicate", 0)),
             ("Content duplicates removed", counts.get("content_duplicate", 0)),
             ("Non-order filings excluded", counts.get("non_order", 0)),
+            (
+                "Orders missing certified dates excluded",
+                counts.get("missing_certified_date", 0),
+            ),
             ("Counsel files collected", counsel_counts.get("collected", 0)),
             ("Counsel files recycled from IRT", counsel_counts.get("irt_existing", 0)),
             ("Counsel errors", counsel_counts.get("error", 0)),
@@ -115,7 +126,11 @@ class ReportWriter:
             in {"duplicate", "consolidated_duplicate", "local_duplicate", "content_duplicate"}
         ]
         errors = [row.as_dict() for row in records if row.status in {"error", "cancelled"}]
-        excluded = [row.as_dict() for row in records if row.status == "non_order"]
+        excluded = [
+            row.as_dict()
+            for row in records
+            if row.status in {"non_order", "missing_certified_date"}
+        ]
         self._add_filenames_sheet(workbook, records)
         self._add_records_sheet(workbook, "Collected", collected)
         self._add_records_sheet(workbook, "Duplicates", duplicates)
@@ -170,7 +185,7 @@ class ReportWriter:
                 sheet.append(
                     [record.target_filename, "\n".join(record.counsel_references)]
                 )
-        self._style(sheet)
+        self._style(sheet, bordered_centered_table=True)
 
     def _add_records_sheet(self, workbook, name: str, rows: list[dict[str, Any]]) -> None:
         sheet = workbook.create_sheet(name)
@@ -199,16 +214,53 @@ class ReportWriter:
     def _label(key: str) -> str:
         return key.replace("_", " ").title().replace("Irt", "IRT").replace("Url", "URL")
 
-    def _style(self, sheet) -> None:
+    def _style(self, sheet, *, bordered_centered_table: bool = False) -> None:
         sheet.freeze_panes = "A2"
         sheet.auto_filter.ref = sheet.dimensions
         for cell in sheet[1]:
             cell.fill = self.HEADER_FILL
             cell.font = self.HEADER_FONT
-            cell.alignment = Alignment(horizontal="center")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
         for column_cells in sheet.columns:
-            max_length = max((len(str(cell.value or "")) for cell in column_cells), default=0)
-            sheet.column_dimensions[get_column_letter(column_cells[0].column)].width = min(max_length + 2, 60)
+            max_length = max(
+                (
+                    max((len(line) for line in str(cell.value or "").splitlines()), default=0)
+                    for cell in column_cells
+                ),
+                default=0,
+            )
+            sheet.column_dimensions[get_column_letter(column_cells[0].column)].width = min(
+                max_length + 2,
+                255,
+            )
         for row in sheet.iter_rows(min_row=2):
             for cell in row:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
+        if bordered_centered_table:
+            self._style_filenames_table(sheet)
+
+    def _style_filenames_table(self, sheet) -> None:
+        """Format only the populated filenames table, including its header."""
+
+        last_nonempty_row = max(
+            (
+                cell.row
+                for row in sheet.iter_rows()
+                for cell in row
+                if cell.value not in (None, "")
+            ),
+            default=1,
+        )
+        for row in sheet.iter_rows(
+            min_row=1,
+            max_row=last_nonempty_row,
+            min_col=1,
+            max_col=sheet.max_column,
+        ):
+            for cell in row:
+                cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                    wrap_text=True,
+                )
+                cell.border = self.TABLE_BORDER

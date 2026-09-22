@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from core.naming import (
+    MissingCertifiedDecisionDateError,
     NamingError,
     NonOrderDocumentError,
     build_filename,
@@ -137,6 +138,70 @@ class NamingTests(unittest.TestCase):
         text = "ORDER\nSome body text\nA TRUE COPY ENTERED AND CERTIFIED\nAugust 13, 2 0 2 6"
         self.assertEqual(extract_miap00_date_from_text(text), "08132026")
 
+    def test_misspelled_footer_months_are_corrected_against_release_date(self):
+        cases = (
+            ("Sepember 17, 2026", "09/17/2026", "09172026"),
+            ("Decmber 8, 2026", "12/08/2026", "12082026"),
+            ("Febraruy 12, 2026", "02/12/2026", "02122026"),
+            ("Agust 3, 2026", "08/03/2026", "08032026"),
+        )
+        for printed_date, release_date, expected in cases:
+            footer = (
+                "A true copy entered and certified by Jerome W. Zimmer Jr., "
+                f"Chief Clerk, on\n{printed_date}\nDate\nChief Clerk"
+            )
+            with self.subTest(printed_date=printed_date), patch(
+                "core.naming.extract_pdf_text", return_value="ORDER"
+            ), patch(
+                "core.naming.extract_pdf_footer_text_with_ocr",
+                return_value=footer,
+            ), patch(
+                "core.naming.extract_pdf_text_with_ocr"
+            ) as full_ocr:
+                result = extract_document_date(
+                    Path("order.pdf"), expected_date=release_date
+                )
+
+            self.assertEqual(result, expected)
+            full_ocr.assert_not_called()
+
+    def test_misspelled_month_requires_matching_release_date(self):
+        footer = (
+            "A true copy entered and certified by Jerome W. Zimmer Jr., "
+            "Chief Clerk, on\nAgust 3, 2026\nDate\nChief Clerk"
+        )
+        with patch("core.naming.extract_pdf_text", return_value="ORDER"), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value=footer,
+        ), patch(
+            "core.naming.extract_pdf_footer_text", return_value=""
+        ), patch(
+            "core.naming.extract_pdf_text_with_ocr", return_value="ORDER"
+        ):
+            with self.assertRaises(MissingCertifiedDecisionDateError):
+                extract_document_date(
+                    Path("order.pdf"), expected_date="09/03/2026"
+                )
+
+    def test_misspelled_body_month_is_not_used_as_decision_date(self):
+        body = "ORDER\nThe response is due Agust 3, 2026."
+        blank_footer = (
+            "A true copy entered and certified by Jerome W. Zimmer Jr., "
+            "Chief Clerk, on\nDate\nChief Clerk"
+        )
+        with patch("core.naming.extract_pdf_text", return_value=body), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value=blank_footer,
+        ), patch(
+            "core.naming.extract_pdf_footer_text", return_value=""
+        ), patch(
+            "core.naming.extract_pdf_text_with_ocr", return_value=body
+        ):
+            with self.assertRaises(MissingCertifiedDecisionDateError):
+                extract_document_date(
+                    Path("order.pdf"), expected_date="08/03/2026"
+                )
+
     def test_body_deadline_is_not_used_as_order_date(self):
         text = (
             "ORDER\nThe motion to extend the brief is GRANTED until "
@@ -180,6 +245,22 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(result, "08122026")
         footer_ocr.assert_called_once()
         full_ocr.assert_not_called()
+
+    def test_blank_certification_date_is_a_document_exclusion(self):
+        footer = (
+            "A true copy entered and certified by Jerome W. Zimmer Jr., "
+            "Chief Clerk, on\nDate ChieTTlerk\nSe Date Chief Clerk"
+        )
+        with patch("core.naming.extract_pdf_text", return_value="ORDER"), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value=footer,
+        ), patch(
+            "core.naming.extract_pdf_text_with_ocr", return_value="ORDER"
+        ):
+            with self.assertRaises(MissingCertifiedDecisionDateError):
+                extract_document_date(
+                    Path("undated-order.pdf"), expected_date="09/15/2026"
+                )
 
     def test_received_party_filing_is_excluded_before_ocr(self):
         filing = (
@@ -332,6 +413,46 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(result, "08132026")
         footer_ocr.assert_called_once()
         full_ocr.assert_not_called()
+
+    def test_footer_text_layer_recovers_date_omitted_by_ocr(self):
+        footer_ocr = (
+            "A true copy entered and certified by Jerome W. Zimmer Jr., "
+            "Chief Clerk, on\nDate ChieTTlerk"
+        )
+        logger = Mock()
+        with patch("core.naming.extract_pdf_text", return_value="ORDER"), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value=footer_ocr,
+        ), patch(
+            "core.naming.extract_pdf_footer_text",
+            return_value="September 18, 2026",
+        ) as footer_layer, patch(
+            "core.naming.extract_pdf_text_with_ocr"
+        ) as full_ocr:
+            result = extract_document_date(
+                Path("381591_17_01.pdf"), expected_date="09/18/2026", logger=logger
+            )
+
+        self.assertEqual(result, "09182026")
+        footer_layer.assert_called_once()
+        full_ocr.assert_not_called()
+        self.assertIn("footer text layer", logger.info.call_args.args[0])
+
+    def test_footer_text_layer_is_not_used_without_certification_legend(self):
+        with patch("core.naming.extract_pdf_text", return_value="ORDER"), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value="Date Chief Clerk",
+        ), patch(
+            "core.naming.extract_pdf_footer_text"
+        ) as footer_layer, patch(
+            "core.naming.extract_pdf_text_with_ocr", return_value="ORDER"
+        ):
+            with self.assertRaises(NamingError):
+                extract_document_date(
+                    Path("order.pdf"), expected_date="09/18/2026"
+                )
+
+        footer_layer.assert_not_called()
 
     def test_certified_footer_date_overrides_release_date_before_irt(self):
         logger = Mock()

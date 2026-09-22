@@ -18,7 +18,11 @@ class Settings:
     irt_court_code: str = "STMIAP00"
     headless: bool = True
     browser_timeout_seconds: int = 60
-    irt_timeout_seconds: int = 120
+    irt_timeout_seconds: int = 240
+    irt_preflight_timeout_seconds: int = 60
+    irt_preflight_days: int = 14
+    irt_overlay_timeout_seconds: int = 600
+    irt_retry_attempts: int = 3
     download_timeout_seconds: int = 90
     location_check_timeout_seconds: int = 8
     request_delay_seconds: float = 1.0

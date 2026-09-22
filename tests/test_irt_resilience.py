@@ -5,7 +5,7 @@ from datetime import date
 
 from selenium.common.exceptions import StaleElementReferenceException
 
-from browser.irt import IRTDuplicateChecker
+from browser.irt import IRTDuplicateChecker, IRTError
 from config.settings import Settings
 
 
@@ -78,6 +78,97 @@ class IRTResilienceTests(unittest.TestCase):
             self.checker._search()
         self.checker.driver.find_element.return_value.click.assert_called_once()
 
+    def test_search_waits_for_ajax_completion_before_accepting_empty_result(self):
+        pending = {
+            "present": True,
+            "processing": False,
+            "request_in_flight": True,
+            "has_records": False,
+            "no_records": True,
+            "signature": "No data found.",
+            "search_token": "search-empty",
+            "request_started": True,
+            "search_mutations": 1,
+            "search_quiet_ms": 300,
+        }
+        complete = {**pending, "xhr_complete": True}
+        with patch.object(
+            self.checker, "_table_state", side_effect=[pending, complete]
+        ) as table_state, patch.object(
+            self.checker, "_arm_search_observer", return_value="search-empty"
+        ), patch.object(
+            self.checker, "_wait_for_request_activity", return_value=True
+        ), patch.object(self.checker, "_server_down", return_value=False), patch(
+            "browser.irt.time.sleep"
+        ):
+            self.checker._search()
+        self.assertEqual(table_state.call_count, 2)
+
+    def test_search_accepts_completed_empty_result_when_jquery_counter_is_stuck(self):
+        empty = {
+            "present": True,
+            "processing": False,
+            "request_in_flight": True,
+            "has_records": False,
+            "no_records": True,
+            "signature": "No data found.",
+            "search_token": "search-empty-complete",
+            "request_started": True,
+            "xhr_complete": True,
+            "search_mutations": 1,
+            "search_quiet_ms": 300,
+        }
+        with patch.object(
+            self.checker, "_table_state", return_value=empty
+        ), patch.object(
+            self.checker,
+            "_arm_search_observer",
+            return_value="search-empty-complete",
+        ), patch.object(
+            self.checker, "_wait_for_request_activity", return_value=True
+        ), patch.object(self.checker, "_server_down", return_value=False), patch(
+            "browser.irt.time.sleep"
+        ):
+            self.checker._search()
+
+    def test_search_ignores_temporary_empty_table_until_overlay_disappears(self):
+        blocked = {
+            "present": True,
+            "processing": False,
+            "block_ui_visible": True,
+            "please_wait_visible": True,
+            "request_in_flight": True,
+            "has_records": False,
+            "no_records": True,
+            "signature": "No data found.",
+            "search_token": "search-overlay",
+            "request_started": True,
+            "search_mutations": 1,
+            "search_quiet_ms": 5000,
+        }
+        completed = {
+            **blocked,
+            "block_ui_visible": False,
+            "please_wait_visible": False,
+            "has_records": True,
+            "no_records": False,
+            "signature": "LNI|LDC_SMD_381120_09222026.pdf",
+            "search_mutations": 2,
+            "search_quiet_ms": 300,
+        }
+        with patch.object(
+            self.checker, "_table_state", side_effect=[blocked, completed]
+        ) as table_state, patch.object(
+            self.checker, "_arm_search_observer", return_value="search-overlay"
+        ), patch.object(
+            self.checker, "_wait_for_request_activity", return_value=True
+        ), patch.object(self.checker, "_server_down", return_value=False), patch(
+            "browser.irt.time.sleep"
+        ):
+            self.checker._search(timeout_seconds=30)
+
+        self.assertEqual(table_state.call_count, 2)
+
     def test_search_uses_javascript_fallback_when_click_starts_no_request(self):
         ready = {
             "present": True,
@@ -122,6 +213,7 @@ class IRTResilienceTests(unittest.TestCase):
             **stale_empty,
             "search_mutations": 2,
             "search_quiet_ms": 300,
+            "xhr_complete": True,
         }
         with patch.object(
             self.checker,
@@ -165,6 +257,61 @@ class IRTResilienceTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(index), 2)
+
+    def test_bulk_index_restarts_browser_after_failed_snapshot(self):
+        expected = {
+            "381120|08122026": [
+                {"File Name": "LDC_SMD_381120_08122026.pdf"}
+            ]
+        }
+        with patch.object(
+            self.checker,
+            "_load_existing_once",
+            side_effect=[IRTError("stalled request"), expected],
+        ) as load_once, patch.object(
+            self.checker, "_restart_browser"
+        ) as restart, patch(
+            "browser.irt.cancellable_wait"
+        ):
+            result = self.checker.load_existing(
+                date(2026, 8, 12), date(2026, 8, 14)
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(load_once.call_count, 2)
+        restart.assert_called_once_with("retrying the complete snapshot")
+
+    def test_preflight_restarts_browser_after_suspicious_empty_result(self):
+        with patch.object(
+            self.checker,
+            "_preflight_once",
+            side_effect=[IRTError("zero inventory records"), None],
+        ) as preflight_once, patch.object(
+            self.checker, "_restart_browser"
+        ) as restart, patch(
+            "browser.irt.cancellable_wait"
+        ):
+            self.checker.preflight(date(2026, 8, 1), date(2026, 8, 31))
+
+        self.assertEqual(preflight_once.call_count, 2)
+        restart.assert_called_once_with("retrying the preflight")
+
+    def test_preflight_uses_short_timeout_and_requires_visible_inventory(self):
+        self.checker.settings.irt_timeout_seconds = 120
+        self.checker.settings.irt_preflight_timeout_seconds = 30
+        row = {"File Name": "LDC_SMD_381120_08122026.pdf"}
+        with patch.object(self.checker, "initialize"), patch.object(
+            self.checker, "_set_field"
+        ), patch.object(self.checker, "_set_date_field"), patch.object(
+            self.checker, "_search"
+        ) as search, patch.object(
+            self.checker, "_records", return_value=[row]
+        ):
+            self.checker._preflight_once(
+                date(2026, 8, 1), date(2026, 8, 31)
+            )
+
+        search.assert_called_once_with(timeout_seconds=30)
 
     def test_bulk_index_fails_closed_when_capture_is_incomplete(self):
         row = {"File Name": "LDC_SMD_381120_08122026.pdf", "LNI": "one"}

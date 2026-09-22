@@ -198,6 +198,25 @@ class ReportingTests(unittest.TestCase):
         )
         self.assertEqual(sheet.freeze_panes, "A2")
         self.assertEqual(sheet.auto_filter.ref, "A1:B2")
+        for row in sheet.iter_rows(min_row=1, max_row=2, min_col=1, max_col=2):
+            for cell in row:
+                self.assertEqual(cell.alignment.horizontal, "center")
+                self.assertEqual(cell.alignment.vertical, "center")
+                self.assertTrue(cell.alignment.wrap_text)
+                self.assertEqual(cell.border.left.style, "thin")
+                self.assertEqual(cell.border.right.style, "thin")
+                self.assertEqual(cell.border.top.style, "thin")
+                self.assertEqual(cell.border.bottom.style, "thin")
+        self.assertGreaterEqual(
+            sheet.column_dimensions["A"].width,
+            len("LDC_SMD_376000_09042026.pdf") + 2,
+        )
+        self.assertGreaterEqual(
+            sheet.column_dimensions["B"].width,
+            len("166699: LDC_SMD_166699counsel.html") + 2,
+        )
+        self.assertIsNone(sheet["A3"].border.left.style)
+        self.assertIsNone(sheet["B3"].border.left.style)
 
 
 if __name__ == "__main__":

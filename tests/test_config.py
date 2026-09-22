@@ -13,6 +13,10 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(settings.require_nonempty_irt_index)
         self.assertTrue(settings.headless)
         self.assertEqual(settings.irt_court_code, "STMIAP00")
+        self.assertEqual(settings.irt_timeout_seconds, 240)
+        self.assertEqual(settings.irt_preflight_timeout_seconds, 60)
+        self.assertEqual(settings.irt_preflight_days, 14)
+        self.assertEqual(settings.irt_overlay_timeout_seconds, 600)
         self.assertEqual(settings.page_size, 100)
         self.assertEqual(settings.sort_order, "Newest")
 

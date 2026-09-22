@@ -225,6 +225,7 @@ class LoggingFormatTests(unittest.TestCase):
                 "local_duplicate": 1,
                 "content_duplicate": 2,
                 "non_order": 1,
+                "missing_certified_date": 2,
                 "counsel_collected": 3,
                 "error": 3,
             }
@@ -232,7 +233,7 @@ class LoggingFormatTests(unittest.TestCase):
         self.assertEqual(
             summary,
             "Orders collected: 4\nCounsels collected: 3\n"
-            "Duplicates: 64\nExcludes: 1\nErrors: 3",
+            "Duplicates: 64\nExcludes: 3\nErrors: 3",
         )
 
     def test_failed_summary_reports_error_when_counts_are_unavailable(self):

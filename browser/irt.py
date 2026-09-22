@@ -7,7 +7,12 @@ import logging
 import time
 from typing import Any
 
-from selenium.common.exceptions import JavascriptException, StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import (
+    JavascriptException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -20,6 +25,7 @@ from core.cancellation import (
 )
 from core.naming import normalize_final_key
 from .webdriver_factory import (
+    ChromeStartupError,
     cancellable_navigate,
     close_chrome_driver,
     create_chrome_driver,
@@ -83,7 +89,10 @@ class IRTDuplicateChecker:
         for attempt in range(1, 4):
             try:
                 raise_if_cancelled(self.cancel_event)
-                self.logger.info("IRT startup attempt %d/3", attempt)
+                self.logger.info(
+                    "IRT startup attempt %d/3 using Chrome",
+                    attempt,
+                )
                 cancellable_navigate(
                     self.driver,
                     self.settings.irt_url,
@@ -112,13 +121,20 @@ class IRTDuplicateChecker:
                     raise IRTError("IRT is displaying its application/server error page")
                 self._set_field(self.COURT_ID, self.settings.irt_court_code)
                 self.initialized = True
-                self.logger.info("IRT search ready for court code %s", self.settings.irt_court_code)
+                self.logger.info(
+                    "IRT search ready for court code %s using Chrome",
+                    self.settings.irt_court_code,
+                )
                 return
             except CollectionCancelled:
                 raise
             except Exception as exc:
                 last_error = exc
-                self.logger.warning("IRT startup attempt %d failed: %s", attempt, exc)
+                self.logger.warning(
+                    "IRT startup attempt %d using Chrome failed: %s",
+                    attempt,
+                    exc,
+                )
                 if attempt < 3:
                     cancellable_wait(
                         self.cancel_event,
@@ -128,6 +144,47 @@ class IRTDuplicateChecker:
         raise IRTError(f"IRT duplicate search could not be initialized: {last_error}")
 
     def load_existing(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Load the complete index, restarting Chrome after recoverable failures."""
+
+        attempts = max(1, int(self.settings.irt_retry_attempts))
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            raise_if_cancelled(self.cancel_event)
+            self.logger.info(
+                "IRT complete snapshot attempt %d/%d using Chrome",
+                attempt,
+                attempts,
+            )
+            try:
+                return self._load_existing_once(start_date, end_date)
+            except CollectionCancelled:
+                raise
+            except (IRTError, WebDriverException, ChromeStartupError) as exc:
+                last_error = exc
+                self.bulk_load_success = False
+                self.logger.warning(
+                    "IRT complete snapshot attempt %d/%d using Chrome failed: %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                if attempt < attempts:
+                    self._restart_browser("retrying the complete snapshot")
+                    cancellable_wait(
+                        self.cancel_event,
+                        2,
+                        "Collection stopped while retrying the IRT snapshot",
+                    )
+        raise IRTError(
+            f"IRT complete snapshot failed after {attempts} fresh-Chrome "
+            f"attempt(s): {last_error}"
+        ) from last_error
+
+    def _load_existing_once(
         self,
         start_date: date,
         end_date: date,
@@ -193,6 +250,73 @@ class IRTDuplicateChecker:
             captured_count,
         )
         return existing
+
+    def preflight(self, start_date: date, end_date: date) -> None:
+        """Prove that IRT can return current inventory before PDF processing."""
+
+        attempts = max(1, int(self.settings.irt_retry_attempts))
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            raise_if_cancelled(self.cancel_event)
+            self.logger.info(
+                "IRT preflight attempt %d/%d using Chrome",
+                attempt,
+                attempts,
+            )
+            try:
+                self._preflight_once(start_date, end_date)
+                return
+            except CollectionCancelled:
+                raise
+            except (IRTError, WebDriverException, ChromeStartupError) as exc:
+                last_error = exc
+                self.logger.warning(
+                    "IRT preflight attempt %d/%d using Chrome failed: %s",
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                if attempt < attempts:
+                    self._restart_browser("retrying the preflight")
+                    cancellable_wait(
+                        self.cancel_event,
+                        2,
+                        "Collection stopped while retrying the IRT preflight",
+                    )
+        raise IRTError(
+            f"IRT preflight failed after {attempts} fresh-Chrome attempt(s): "
+            f"{last_error}"
+        ) from last_error
+
+    def _preflight_once(self, start_date: date, end_date: date) -> None:
+        self.initialize()
+        self._set_field(self.DOCKET_ID, "")
+        self._set_field(self.FILE_NAME_ID, "")
+        self._set_field(self.COURT_ID, self.settings.irt_court_code)
+        self._set_date_field(self.DATE_FROM_ID, start_date.strftime("%m-%d-%Y"))
+        self._set_date_field(self.DATE_TO_ID, end_date.strftime("%m-%d-%Y"))
+        self.logger.info(
+            "Checking IRT availability for %s from %s through %s before downloads",
+            self.settings.irt_court_code,
+            start_date.strftime("%m-%d-%Y"),
+            end_date.strftime("%m-%d-%Y"),
+        )
+        self._search(
+            timeout_seconds=min(
+                self.settings.irt_timeout_seconds,
+                self.settings.irt_preflight_timeout_seconds,
+            )
+        )
+        records = self._records()
+        if not records:
+            raise IRTError(
+                "IRT preflight returned zero inventory records for court code "
+                f"{self.settings.irt_court_code}"
+            )
+        self.logger.info(
+            "IRT preflight passed: %d inventory record(s) visible on the first page",
+            len(records),
+        )
 
     @staticmethod
     def duplicate_records(
@@ -314,7 +438,7 @@ class IRTDuplicateChecker:
                 f"IRT date field {element_id} did not retain {value!r}; found {actual!r}"
             )
 
-    def _search(self) -> None:
+    def _search(self, *, timeout_seconds: float | None = None) -> None:
         raise_if_cancelled(self.cancel_event)
         search_token = self._arm_search_observer()
         button = self.driver.find_element(By.ID, self.SEARCH_ID)
@@ -335,7 +459,10 @@ class IRTDuplicateChecker:
             if not self._wait_for_request_activity():
                 raise IRTError("IRT snapshot search did not start after the JavaScript fallback")
 
+        overlay_seen = False
+
         def ready(driver) -> bool:
+            nonlocal overlay_seen
             raise_if_cancelled(
                 self.cancel_event,
                 "Collection stopped while waiting for IRT results",
@@ -346,21 +473,36 @@ class IRTDuplicateChecker:
                 state = self._table_state()
             except (JavascriptException, StaleElementReferenceException):
                 return False
-            if (
-                not state.get("present")
-                or state.get("processing")
-                or state.get("request_in_flight")
-            ):
+            overlay_visible = bool(
+                state.get("please_wait_visible") or state.get("block_ui_visible")
+            )
+            if overlay_visible:
+                if not overlay_seen:
+                    self.logger.info(
+                        "IRT Please Wait overlay detected; waiting for it to disappear"
+                    )
+                overlay_seen = True
+                return False
+            if not state.get("present") or state.get("processing"):
                 return False
             has_results = bool(state.get("has_records") or state.get("no_records"))
             if not has_results:
+                return False
+            # IRT briefly paints "No data found" while its full-page blocker is
+            # still visible.  A completed Ajax event or a blocker that was seen
+            # and then disappeared proves the displayed table is now final.
+            empty_result = bool(state.get("no_records") and not state.get("has_records"))
+            completion_proven = bool(state.get("xhr_complete") or overlay_seen)
+            if empty_result and not completion_proven:
+                return False
+            if state.get("request_in_flight") and not completion_proven:
                 return False
             # Never accept a table based on elapsed time. The table must prove
             # that this specific Search click caused an Ajax completion or DOM
             # redraw, then remain quiet briefly with the processing layer off.
             belongs_to_search = state.get("search_token") == search_token
             refreshed = bool(
-                state.get("xhr_complete")
+                completion_proven
                 or state.get("processing_seen")
                 or (
                     state.get("request_started")
@@ -371,7 +513,15 @@ class IRTDuplicateChecker:
             return belongs_to_search and refreshed and settled
 
         try:
-            self._wait(self.settings.irt_timeout_seconds, ready)
+            normal_timeout = timeout_seconds or self.settings.irt_timeout_seconds
+            effective_timeout = max(
+                normal_timeout,
+                self.settings.irt_overlay_timeout_seconds,
+            )
+            self._wait(
+                effective_timeout,
+                ready,
+            )
         except TimeoutException as exc:
             final_state = self._table_state()
             self.logger.error("IRT table state at timeout: %s", final_state)
@@ -379,6 +529,7 @@ class IRTDuplicateChecker:
                 "IRT result table did not finish loading before timeout "
                 f"(present={final_state.get('present')}, "
                 f"processing={final_state.get('processing')}, "
+                f"please_wait_visible={final_state.get('please_wait_visible')}, "
                 f"has_records={final_state.get('has_records')}, "
                 f"no_records={final_state.get('no_records')})"
             ) from exc
@@ -494,12 +645,19 @@ class IRTDuplicateChecker:
             if (processingVisible) search.processingSeen = true;
             const jqActive = typeof window.jQuery !== 'undefined'
               ? Number(window.jQuery.active || 0) : 0;
-            const blockUiVisible = Array.from(
-              document.querySelectorAll('div.blockUI, div.blockOverlay')
-            ).some(node => {
+            const visible = node => {
+              if (!node) return false;
               const style = getComputedStyle(node);
-              return style.display !== 'none' && style.visibility !== 'hidden';
-            });
+              return style.display !== 'none' && style.visibility !== 'hidden' &&
+                Number(style.opacity || 1) > 0 && node.getClientRects().length > 0;
+            };
+            const blockNodes = Array.from(document.querySelectorAll(
+              'div.blockUI, div.blockOverlay, div.blockMsg, [class*="blockUI"]'
+            ));
+            const blockUiVisible = blockNodes.some(visible);
+            const pleaseWaitVisible = blockNodes.some(node =>
+              visible(node) && /please\s*wait/i.test(node.textContent || '')
+            );
             const rows = Array.from(table.querySelectorAll('tbody tr'));
             const rowText = rows.map(row =>
               (row.textContent || '').replace(/\s+/g, ' ').trim()
@@ -518,6 +676,8 @@ class IRTDuplicateChecker:
               present: true,
               processing: processingVisible,
               request_in_flight: jqActive > 0 || blockUiVisible,
+              block_ui_visible: blockUiVisible,
+              please_wait_visible: pleaseWaitVisible,
               no_records: noRecords,
               has_records: hasRecords,
               signature: rowText.join('|'),
@@ -631,6 +791,13 @@ class IRTDuplicateChecker:
         except Exception:
             return False
         return all(marker in text for marker in self.SERVER_DOWN_MARKERS)
+
+    def _restart_browser(self, context: str) -> None:
+        self.logger.info(
+            "Restarting IRT Chrome session before %s",
+            context,
+        )
+        self.close()
 
     def close(self) -> None:
         if self.driver:

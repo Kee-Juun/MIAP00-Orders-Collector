@@ -7,4 +7,6 @@ config.json
 build/
 dist/
 tmp/
+outputs/
+.test-tmp/
 .git_upload/

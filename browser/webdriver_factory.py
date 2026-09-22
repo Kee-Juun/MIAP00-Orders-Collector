@@ -1,4 +1,4 @@
-"""Chrome WebDriver construction shared by browser integrations."""
+"""WebDriver construction shared by browser integrations."""
 
 from __future__ import annotations
 
@@ -18,15 +18,11 @@ class ChromeStartupError(RuntimeError):
     pass
 
 
-def create_chrome_driver(
-    logger: logging.Logger,
-    *,
-    headless: bool,
-    download_dir: Path | None = None,
-    chromedriver_path: str = "",
-    timeout: int = 60,
-) -> webdriver.Chrome:
-    options = Options()
+def browser_mode_label(headless: bool) -> str:
+    return "Background (headless)" if headless else "Visible windows"
+
+
+def _configure_options(options, *, headless: bool, download_dir: Path | None) -> None:
     if headless:
         options.add_argument("--headless=new")
     options.page_load_strategy = "eager"
@@ -45,21 +41,39 @@ def create_chrome_driver(
                 "plugins.always_open_pdf_externally": True,
             },
         )
+
+
+def create_chrome_driver(
+    logger: logging.Logger,
+    *,
+    headless: bool,
+    download_dir: Path | None = None,
+    chromedriver_path: str = "",
+    timeout: int = 60,
+) -> webdriver.Chrome:
+    options = Options()
+    _configure_options(options, headless=headless, download_dir=download_dir)
     try:
         if chromedriver_path:
             path = Path(chromedriver_path).expanduser()
             if not path.is_file():
-                raise ChromeStartupError(f"Configured ChromeDriver does not exist: {path}")
+                raise ChromeStartupError(
+                    f"Configured ChromeDriver does not exist: {path}"
+                )
             driver = webdriver.Chrome(service=Service(str(path)), options=options)
         else:
             driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(timeout)
         driver.implicitly_wait(0)
         capabilities = driver.capabilities or {}
+        driver_version = str(
+            (capabilities.get("chrome") or {}).get("chromedriverVersion", "unknown")
+        ).split()[0]
         logger.info(
-            "Chrome ready: browser=%s driver=%s",
+            "Chrome ready: browser=%s driver=%s mode=%s",
             capabilities.get("browserVersion", "unknown"),
-            str((capabilities.get("chrome") or {}).get("chromedriverVersion", "unknown")).split()[0],
+            driver_version,
+            browser_mode_label(headless),
         )
         return driver
     except ChromeStartupError:
@@ -78,7 +92,7 @@ def close_chrome_driver(
     *,
     timeout: float = 3.0,
 ) -> None:
-    """Quit Chrome cleanly without letting a stuck driver freeze Stop forever."""
+    """Quit Chrome without letting a stuck driver freeze Stop forever."""
 
     finished = threading.Event()
 
@@ -99,7 +113,10 @@ def close_chrome_driver(
     if finished.wait(timeout):
         return
 
-    logger.warning("Chrome did not close within %.1f seconds; stopping its driver service", timeout)
+    logger.warning(
+        "Chrome did not close within %.1f seconds; stopping its driver service",
+        timeout,
+    )
     service = getattr(driver, "service", None)
     process = getattr(service, "process", None)
     if process is None or process.poll() is not None:
@@ -112,10 +129,8 @@ def close_chrome_driver(
             process.kill()
         except Exception:
             pass
-
-
 def cancellable_navigate(
-    driver: webdriver.Chrome,
+    driver,
     url: str,
     cancel_event=None,
     *,

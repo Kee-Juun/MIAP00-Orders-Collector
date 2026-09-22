@@ -42,6 +42,10 @@ class NonOrderDocumentError(NamingError):
     """The Orders search returned a document that is not a court order."""
 
 
+class MissingCertifiedDecisionDateError(NamingError):
+    """A court order has a certification block whose date field is blank."""
+
+
 def extract_source_docket(filename: str) -> str:
     match = MIAP00_SOURCE_PATTERN.search(Path(filename).name)
     if not match:
@@ -142,6 +146,34 @@ def extract_document_date(
     has_certified_footer_date = bool(date_value)
     if not date_value:
         date_value = _extract_expected_date_from_footer(footer_text, expected_date)
+    if not date_value and _has_certification_legend(footer_text):
+        # Some Michigan PDFs keep the printed footer date in their text layer
+        # while rendering the certification legend and signatures as images.
+        # Tesseract can therefore see the legend but omit a clearly populated
+        # date.  Read only the physical footer region and combine it with the
+        # OCR legend so a body date can never become the decision date.
+        footer_layer_text = extract_pdf_footer_text(
+            pdf_path,
+            max_pages=max_pages,
+            logger=logger,
+            cancel_event=cancel_event,
+        )
+        date_value = _extract_order_date(
+            "\n".join(text for text in (footer_text, footer_layer_text) if text)
+        )
+        if not date_value:
+            date_value = _extract_expected_date_from_footer(
+                "\n".join(
+                    text for text in (footer_text, footer_layer_text) if text
+                ),
+                expected_date,
+            )
+        if date_value:
+            _log(
+                logger,
+                "info",
+                f"Recovered certified date from PDF footer text layer: {pdf_path.name}",
+            )
     if not date_value:
         _log(logger, "info", f"Footer OCR was inconclusive; trying full-page OCR: {pdf_path.name}")
         ocr_text = extract_pdf_text_with_ocr(
@@ -153,6 +185,11 @@ def extract_document_date(
         date_value = _extract_order_date(ocr_text)
         has_certified_footer_date = bool(date_value)
     if not date_value:
+        if _has_blank_certification_date(footer_text):
+            raise MissingCertifiedDecisionDateError(
+                "Certified MIAP00 decision date is blank in "
+                f"{pdf_path.name}"
+            )
         raise NamingError(
             f"No certified MIAP00 decision date found in {pdf_path.name}"
         )
@@ -312,6 +349,21 @@ def _extract_order_date(text: str) -> str:
     return ""
 
 
+def _has_blank_certification_date(text: str) -> bool:
+    """Recognize a visible certification block with an unfilled Date field."""
+
+    normalized = _normalize_line(text)
+    if "A TRUE COPY ENTERED AND CERTIFIED" not in normalized:
+        return False
+    if not re.search(r"\bDATE\b", normalized):
+        return False
+    return not bool(_extract_order_date(text))
+
+
+def _has_certification_legend(text: str) -> bool:
+    return "A TRUE COPY ENTERED AND CERTIFIED" in _normalize_line(text)
+
+
 def _validate_expected_date(
     date_value: str,
     expected_date: str,
@@ -373,7 +425,65 @@ def _extract_expected_date_from_footer(text: str, expected_date: str) -> str:
     for line in text.splitlines():
         if _extract_date_from_line(line) == expected:
             return expected
+        if _line_has_fuzzy_expected_date(line, expected):
+            return expected
     return ""
+
+
+def _line_has_fuzzy_expected_date(line: str, expected: str) -> bool:
+    """Match a misspelled month only when day/year and live-site month agree."""
+
+    expected_date = datetime.datetime.strptime(expected, "%m%d%Y").date()
+    expected_month = expected_date.strftime("%B").lower()
+    candidates = re.finditer(
+        r"\b([A-Za-z]{4,12})\s+(\d{1,2}),\s+(\d\s*\d\s*\d\s*\d)\b",
+        line,
+        re.IGNORECASE,
+    )
+    for match in candidates:
+        month_word = match.group(1).lower()
+        day = int(match.group(2))
+        year = int(re.sub(r"\s+", "", match.group(3)))
+        if day != expected_date.day or year != expected_date.year:
+            continue
+        # Permit the small omissions, insertions, substitutions, and adjacent
+        # transpositions seen in court-generated dates. The expected release
+        # month supplies the disambiguation; arbitrary body dates never reach
+        # this footer-only helper.
+        allowed_edits = max(1, len(expected_month) // 4)
+        if _edit_distance(month_word, expected_month) <= allowed_edits:
+            return True
+    return False
+
+
+def _edit_distance(left: str, right: str) -> int:
+    """Return Damerau-Levenshtein distance for short OCR/month tokens."""
+
+    rows = len(left) + 1
+    cols = len(right) + 1
+    distance = [[0] * cols for _ in range(rows)]
+    for row in range(rows):
+        distance[row][0] = row
+    for col in range(cols):
+        distance[0][col] = col
+    for row in range(1, rows):
+        for col in range(1, cols):
+            substitution = 0 if left[row - 1] == right[col - 1] else 1
+            distance[row][col] = min(
+                distance[row - 1][col] + 1,
+                distance[row][col - 1] + 1,
+                distance[row - 1][col - 1] + substitution,
+            )
+            if (
+                row > 1
+                and col > 1
+                and left[row - 1] == right[col - 2]
+                and left[row - 2] == right[col - 1]
+            ):
+                distance[row][col] = min(
+                    distance[row][col], distance[row - 2][col - 2] + 1
+                )
+    return distance[-1][-1]
 
 
 def _normalize_expected_date(value: str) -> str:
@@ -459,6 +569,50 @@ def extract_pdf_text(
         raise
     except Exception as exc:
         _log(logger, "warning", f"Unable to extract PDF text from {pdf_path.name}: {exc}")
+        return ""
+
+
+def extract_pdf_footer_text(
+    pdf_path: Path,
+    max_pages: int = 2,
+    logger=None,
+    cancel_event=None,
+) -> str:
+    """Read embedded text only from the lower portion of the final pages."""
+
+    try:
+        import fitz
+
+        texts: list[str] = []
+        with fitz.open(str(pdf_path)) as document:
+            page_limit = min(max_pages, document.page_count)
+            page_indexes = range(
+                document.page_count - 1,
+                document.page_count - page_limit - 1,
+                -1,
+            )
+            for page_index in page_indexes:
+                raise_if_cancelled(
+                    cancel_event,
+                    "Collection stopped while reading PDF footer text",
+                )
+                page = document.load_page(page_index)
+                clip = fitz.Rect(
+                    page.rect.x0,
+                    page.rect.y0 + page.rect.height * 0.55,
+                    page.rect.x1,
+                    page.rect.y1,
+                )
+                texts.append(page.get_text("text", clip=clip, sort=True) or "")
+        return "\n".join(texts)
+    except CollectionCancelled:
+        raise
+    except Exception as exc:
+        _log(
+            logger,
+            "warning",
+            f"Unable to read PDF footer text layer from {pdf_path.name}: {exc}",
+        )
         return ""
 
 

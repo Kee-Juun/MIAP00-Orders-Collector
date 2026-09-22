@@ -68,6 +68,7 @@ DUPLICATE_STATUSES = (
 )
 EXCLUDED_STATUSES = (
     "non_order",
+    "missing_certified_date",
 )
 MESSAGE_KINDS = {"success", "warning", "error", "info"}
 
@@ -664,11 +665,19 @@ def friendly_status(line: str) -> str | None:
         return f"Downloading and preparing PDFs  •  {progress}"
     if message.startswith("Reading certification footer with OCR:"):
         return "Reading the certified court decision date..."
+    if message.startswith("Running IRT preflight"):
+        return "Checking IRT availability before downloads…"
+    if message.startswith("IRT preflight attempt"):
+        return "Checking IRT availability before downloads…"
+    if message.startswith("Restarting IRT ") and " session" in message:
+        return "Reconnecting to IRT in a fresh browser…"
     if message.startswith("IRT startup attempt"):
         return "Connecting to IRT duplicate search…"
     if message.startswith("IRT search ready"):
         return "IRT duplicate search ready."
     if message.startswith("IRT bulk duplicate check:"):
+        return "Loading the complete IRT date-range snapshot…"
+    if message.startswith("IRT complete snapshot attempt"):
         return "Loading the complete IRT date-range snapshot…"
     if message.startswith("Loading one complete IRT snapshot"):
         return "Waiting for the complete IRT results table…"

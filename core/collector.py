@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import calendar
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import logging
 from pathlib import Path
 import re
@@ -20,11 +21,13 @@ from .content_duplicates import (
 from browser.irt import IRTDuplicateChecker, IRTError
 from browser.michigan_counsel import CounselCollectionError, MichiganCounselSite
 from browser.michigan_courts import MichiganOrdersSite
+from browser.webdriver_factory import browser_mode_label
 from reporting.excel_report import ReportWriter
 from utils.logging import create_logger
 from .models import CounselRecord, OrderResult, ProcessingRecord
 from .location_check import verify_us_location
 from .naming import (
+    MissingCertifiedDecisionDateError,
     NonOrderDocumentError,
     build_filename,
     extract_document_date,
@@ -35,6 +38,37 @@ from .naming import (
 
 class CollectionError(RuntimeError):
     pass
+
+
+def _one_calendar_month_before(value: date) -> date:
+    """Return the same day in the prior month, clamped at month end."""
+
+    year = value.year if value.month > 1 else value.year - 1
+    month = value.month - 1 if value.month > 1 else 12
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def main_irt_received_date_range(
+    start_date: date,
+    end_date: date,
+    certified_dates: list[date],
+    *,
+    today: date | None = None,
+) -> tuple[date, date]:
+    """Build the broad IRT received-date window used for order deduplication.
+
+    Michigan release dates and certified document dates are not IRT receipt
+    dates. Inventory can be created days later, so begin one calendar month
+    before the earliest relevant decision date and search through today.
+    """
+
+    earliest_decision = min([start_date, *certified_dates])
+    latest_decision = max([end_date, *certified_dates])
+    return (
+        _one_calendar_month_before(earliest_decision),
+        max(today or date.today(), latest_decision),
+    )
 
 
 def collected_orders_directory_for_run(run_dir: Path) -> Path:
@@ -151,6 +185,10 @@ class MIAP00Collector:
         try:
             self.logger.info("MIAP00 Orders Collector started")
             self.logger.info(
+                "Browser mode: %s",
+                browser_mode_label(self.settings.headless),
+            )
+            self.logger.info(
                 "U.S. location preflight passed: %s", location.display_name
             )
             self.logger.info("Run folder: %s", self.run_dir)
@@ -174,6 +212,21 @@ class MIAP00Collector:
                 return self._finish_report(discovered, records, started_at)
 
             start_date, end_date = self.settings.resolved_date_range()
+            preflight_end = max(date.today(), end_date)
+            preflight_days = max(1, int(self.settings.irt_preflight_days))
+            preflight_start = preflight_end - timedelta(days=preflight_days - 1)
+            self.logger.info(
+                "Running IRT preflight before downloading %d order candidate(s)",
+                len(discovered),
+            )
+            try:
+                irt.preflight(preflight_start, preflight_end)
+            except IRTError as exc:
+                raise CollectionError(
+                    "IRT preflight could not confirm a working duplicate search. "
+                    "No order PDFs were downloaded."
+                ) from exc
+
             ordered = sorted(discovered, key=lambda item: item.original_filename.lower())
             occurrences: defaultdict[tuple[str, str], int] = defaultdict(int)
             total = len(ordered)
@@ -238,7 +291,12 @@ class MIAP00Collector:
                 except CollectionCancelled:
                     temp_path.unlink(missing_ok=True)
                     raise
-                except NonOrderDocumentError as exc:
+                except (NonOrderDocumentError, MissingCertifiedDecisionDateError) as exc:
+                    exclusion_status = (
+                        "missing_certified_date"
+                        if isinstance(exc, MissingCertifiedDecisionDateError)
+                        else "non_order"
+                    )
                     try:
                         records.append(
                             self._preserve_excluded_file(
@@ -246,6 +304,7 @@ class MIAP00Collector:
                                 temp_path,
                                 byte_count,
                                 str(exc),
+                                status=exclusion_status,
                             )
                         )
                     except Exception as preserve_exc:
@@ -298,17 +357,21 @@ class MIAP00Collector:
                     datetime.strptime(item.document_date, "%m%d%Y").date()
                     for item in pending
                 ]
-                irt_start_date = min(start_date, min(certified_dates))
-                irt_end_date = max(end_date, max(certified_dates))
-                if irt_start_date != start_date or irt_end_date != end_date:
-                    self.logger.info(
-                        "IRT snapshot range expanded to cover certified decision dates: "
-                        "%s through %s (user range %s through %s)",
-                        irt_start_date.strftime("%m-%d-%Y"),
-                        irt_end_date.strftime("%m-%d-%Y"),
-                        start_date.strftime("%m-%d-%Y"),
-                        end_date.strftime("%m-%d-%Y"),
-                    )
+                irt_start_date, irt_end_date = main_irt_received_date_range(
+                    start_date,
+                    end_date,
+                    certified_dates,
+                )
+                self.logger.info(
+                    "IRT received-date snapshot expanded for delayed inventory: "
+                    "%s through %s (user release range %s through %s; "
+                    "oldest certified decision %s)",
+                    irt_start_date.strftime("%m-%d-%Y"),
+                    irt_end_date.strftime("%m-%d-%Y"),
+                    start_date.strftime("%m-%d-%Y"),
+                    end_date.strftime("%m-%d-%Y"),
+                    min(certified_dates).strftime("%m-%d-%Y"),
+                )
                 self.logger.info(
                     "IRT bulk duplicate check: capturing %s from %s through %s once",
                     self.settings.irt_court_code,
@@ -549,6 +612,8 @@ class MIAP00Collector:
         source_path: Path,
         byte_count: int,
         reason: str,
+        *,
+        status: str = "non_order",
     ) -> ProcessingRecord:
         """Keep an excluded source PDF unchanged for post-run spot-checking."""
 
@@ -563,12 +628,12 @@ class MIAP00Collector:
         self._ensure_excluded_dir()
         source_path.replace(destination)
         self.logger.warning(
-            "Excluded non-order document saved for review without renaming: %s (%s)",
+            "Excluded document saved for review without renaming: %s (%s)",
             order.original_filename,
             reason,
         )
         return ProcessingRecord(
-            status="non_order",
+            status=status,
             docket=order.docket,
             title=order.title,
             release_date=order.release_date,
