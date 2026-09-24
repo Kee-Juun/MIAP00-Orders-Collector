@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from collections import Counter
 from datetime import datetime
 import json
 from pathlib import Path
-import re
 from typing import Any, Iterable
 
 from openpyxl import Workbook
@@ -12,39 +10,11 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from core.models import CounselRecord, OrderResult, ProcessingRecord
+from core.release_delivery import dominant_collected_document_date
 
 
 def report_path_for_run(run_dir: Path) -> Path:
     return run_dir / f"Report_{run_dir.name}.xlsx"
-
-
-FINAL_ORDER_DATE_RE = re.compile(r"_(\d{8})\.pdf$", re.IGNORECASE)
-
-
-def dominant_collected_document_date(
-    records: list[ProcessingRecord],
-) -> str | None:
-    """Return the most common certified date, preferring the latest on a tie."""
-
-    dates: list[str] = []
-    for record in records:
-        if record.status != "collected" or not record.target_filename:
-            continue
-        value = record.document_date.strip()
-        if not value:
-            match = FINAL_ORDER_DATE_RE.search(record.target_filename)
-            value = match.group(1) if match else ""
-        try:
-            datetime.strptime(value, "%m%d%Y")
-        except (TypeError, ValueError):
-            continue
-        dates.append(value)
-    if not dates:
-        return None
-    counts = Counter(dates)
-    highest_count = max(counts.values())
-    tied = [value for value, count in counts.items() if count == highest_count]
-    return max(tied, key=lambda value: datetime.strptime(value, "%m%d%Y"))
 
 
 def release_filenames_path_for_run(

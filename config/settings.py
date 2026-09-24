@@ -36,6 +36,9 @@ class Settings:
     require_nonempty_irt_index: bool = True
     collect_counsel: bool = True
     counsel_irt_years_back: int = 2
+    release_shared_root: str = (
+        r"\\corp.regn.net\syd\REPH-ILO CLOps SADM\MIAP courts\MIAP00"
+    )
     chromedriver_path: str = ""
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

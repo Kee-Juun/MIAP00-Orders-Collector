@@ -26,11 +26,16 @@ from reporting.excel_report import ReportWriter
 from utils.logging import create_logger
 from .models import CounselRecord, OrderResult, ProcessingRecord
 from .location_check import verify_us_location
+from .release_delivery import (
+    build_consolidated_release_folder,
+    publish_consolidated_release_folder,
+)
 from .naming import (
     MissingCertifiedDecisionDateError,
     NonOrderDocumentError,
     build_filename,
     extract_document_date,
+    extract_primary_docket,
     extract_source_docket,
     sha256_file,
 )
@@ -128,7 +133,7 @@ def collected_directory_for_run(run_dir: Path) -> Path:
 @dataclass
 class PendingDownload:
     order: OrderResult
-    source_docket: str
+    primary_docket: str
     target_filename: str
     document_date: str
     byte_count: int
@@ -152,6 +157,7 @@ class MIAP00Collector:
         self.collected_dir: Path | None = None
         self.counsel_dir: Path | None = None
         self.excluded_dir: Path | None = None
+        self.release_dir: Path | None = None
         self.logger: logging.Logger | None = None
         self.last_counts: dict[str, int] = {}
         self.counsel_records: list[CounselRecord] = []
@@ -160,6 +166,7 @@ class MIAP00Collector:
     def run(self) -> Path:
         self.was_cancelled = False
         self.counsel_records = []
+        self.release_dir = None
         location = verify_us_location(
             timeout_seconds=self.settings.location_check_timeout_seconds
         )
@@ -246,7 +253,13 @@ class MIAP00Collector:
                         cancel_event=self.cancel_event,
                     )
                     raise_if_cancelled(self.cancel_event)
-                    docket = extract_source_docket(order.original_filename)
+                    source_docket = extract_source_docket(order.original_filename)
+                    docket = extract_primary_docket(
+                        temp_path,
+                        source_docket,
+                        logger=self.logger,
+                        cancel_event=self.cancel_event,
+                    )
                     document_date = extract_document_date(
                         temp_path,
                         logger=self.logger,
@@ -281,7 +294,7 @@ class MIAP00Collector:
                     pending.append(
                         PendingDownload(
                             order=order,
-                            source_docket=docket,
+                            primary_docket=docket,
                             target_filename=target_filename,
                             document_date=document_date,
                             byte_count=byte_count,
@@ -406,7 +419,7 @@ class MIAP00Collector:
                     (
                         ProcessingRecord(
                             status="pending",
-                            docket=item.source_docket,
+                            docket=item.primary_docket,
                             title=item.order.title,
                             release_date=item.order.release_date,
                             source_filename=item.order.original_filename,
@@ -449,6 +462,7 @@ class MIAP00Collector:
                                 item.path,
                                 "Matching filename in complete IRT date-range snapshot",
                                 duplicates,
+                                docket=item.primary_docket,
                             )
                         )
                         item.path.unlink(missing_ok=True)
@@ -479,6 +493,7 @@ class MIAP00Collector:
                                     item.path,
                                     reason,
                                     content_match.irt_evidence,
+                                    docket=item.primary_docket,
                                 )
                             )
                             item.path.unlink(missing_ok=True)
@@ -506,6 +521,7 @@ class MIAP00Collector:
                                 item.path,
                                 reason,
                                 content_match.irt_evidence,
+                                docket=item.primary_docket,
                             )
                         )
                         item.path.unlink(missing_ok=True)
@@ -528,6 +544,7 @@ class MIAP00Collector:
                                 item.path,
                                 reason,
                                 [],
+                                docket=item.primary_docket,
                             )
                         )
                         item.path.unlink(missing_ok=True)
@@ -545,6 +562,7 @@ class MIAP00Collector:
                         target_path,
                         "Passed complete IRT date-range snapshot duplicate check",
                         [],
+                        docket=item.primary_docket,
                     )
                     record.sha256 = digest
                     records.append(record)
@@ -561,6 +579,7 @@ class MIAP00Collector:
             )
             if self.settings.collect_counsel:
                 self._collect_counsel(records, site, irt)
+            self._build_release_folder(records)
             return self._finish_report(discovered, records, started_at)
         except CollectionCancelled as exc:
             self.was_cancelled = True
@@ -689,7 +708,7 @@ class MIAP00Collector:
             records.append(
                 ProcessingRecord(
                     status="cancelled",
-                    docket=item.source_docket if item else order.docket,
+                    docket=item.primary_docket if item else order.docket,
                     title=order.title,
                     release_date=order.release_date,
                     source_filename=order.original_filename,
@@ -709,6 +728,26 @@ class MIAP00Collector:
         records: list[ProcessingRecord],
         started_at: datetime,
     ) -> Path:
+        report_writer = ReportWriter(self.run_dir, self.logger)
+        report_writer.write(
+            discovered,
+            records,
+            self.counsel_records,
+            started_at,
+            datetime.now(),
+            self.settings.to_dict(),
+        )
+        if self._publish_release_if_clean(records):
+            # A shared-copy failure is a run error. Rewrite the report so the
+            # saved documentation and final UI summary both include it.
+            report_writer.write(
+                discovered,
+                records,
+                self.counsel_records,
+                started_at,
+                datetime.now(),
+                self.settings.to_dict(),
+            )
         counts: dict[str, int] = {}
         for record in records:
             counts[record.status] = counts.get(record.status, 0) + 1
@@ -724,14 +763,6 @@ class MIAP00Collector:
         )
         if counsel_errors:
             self.last_counts["error"] = self.last_counts.get("error", 0) + counsel_errors
-        ReportWriter(self.run_dir, self.logger).write(
-            discovered,
-            records,
-            self.counsel_records,
-            started_at,
-            datetime.now(),
-            self.settings.to_dict(),
-        )
         collected = counts.get("collected", 0)
         duplicates = sum(
             counts.get(status, 0)
@@ -753,6 +784,88 @@ class MIAP00Collector:
             errors,
         )
         return self.run_dir
+
+    def _build_release_folder(
+        self,
+        records: list[ProcessingRecord],
+    ) -> None:
+        """Create the combined local folder, retaining it even if publishing is unsafe."""
+
+        if self.run_dir is None or self.collected_dir is None or self.counsel_dir is None:
+            raise CollectionError("Release delivery destinations were not initialized")
+        try:
+            self.release_dir = build_consolidated_release_folder(
+                self.run_dir,
+                records,
+                self.collected_dir,
+                self.counsel_dir,
+                self.logger,
+                cancel_event=self.cancel_event,
+            )
+        except CollectionCancelled:
+            raise
+        except Exception as exc:
+            self.logger.exception("Consolidated release delivery failed")
+            records.append(
+                ProcessingRecord(
+                    status="error",
+                    docket="",
+                    title="Consolidated release delivery",
+                    release_date="",
+                    source_filename="",
+                    source_url="",
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+            )
+
+    def _publish_release_if_clean(
+        self,
+        records: list[ProcessingRecord],
+    ) -> bool:
+        """Publish only a zero-error run; return True if a delivery error was added."""
+
+        if self.release_dir is None:
+            return False
+        order_errors = sum(record.status == "error" for record in records)
+        counsel_errors = sum(
+            record.status == "error" for record in self.counsel_records
+        )
+        if self.was_cancelled or order_errors or counsel_errors:
+            self.logger.warning(
+                "Shared release copy skipped for safety: cancelled=%s "
+                "order_errors=%d counsel_errors=%d",
+                self.was_cancelled,
+                order_errors,
+                counsel_errors,
+            )
+            return False
+        try:
+            shared_root_value = self.settings.release_shared_root.strip()
+            if not shared_root_value:
+                raise CollectionError("The shared release destination is not configured")
+            publish_consolidated_release_folder(
+                self.release_dir,
+                Path(shared_root_value),
+                self.logger,
+                cancel_event=self.cancel_event,
+            )
+            return False
+        except CollectionCancelled:
+            raise
+        except Exception as exc:
+            self.logger.exception("Consolidated release publishing failed")
+            records.append(
+                ProcessingRecord(
+                    status="error",
+                    docket="",
+                    title="Consolidated release publishing",
+                    release_date="",
+                    source_filename="",
+                    source_url="",
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+            )
+            return True
 
     def _collect_counsel(
         self,
@@ -925,10 +1038,12 @@ class MIAP00Collector:
         path: Path,
         reason: str,
         evidence: list[dict],
+        *,
+        docket: str = "",
     ) -> ProcessingRecord:
         return ProcessingRecord(
             status=status,
-            docket=order.docket,
+            docket=docket or order.docket,
             title=order.title,
             release_date=order.release_date,
             source_filename=order.original_filename,

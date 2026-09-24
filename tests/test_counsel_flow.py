@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import requests
+from selenium.common.exceptions import TimeoutException
 
 from browser.michigan_counsel import CounselCollectionError, MichiganCounselSite
 from config.settings import Settings
@@ -202,6 +203,60 @@ class CounselFlowTests(unittest.TestCase):
         self.assertEqual(events, ["advanced", "field"])
         field.send_keys.assert_called_once_with("379218")
         search_button.click.assert_called_once_with()
+
+    def test_renderer_timeout_restarts_chrome_and_retries_same_docket(self):
+        logger = Mock()
+        orders_site = Mock()
+        counsel_site = MichiganCounselSite(Settings(), logger, orders_site)
+        renderer_timeout = TimeoutException(
+            "timeout: Timed out receiving message from renderer"
+        )
+        first_failure = CounselCollectionError(
+            "Michigan Advanced Search button did not become available"
+        )
+        first_failure.__cause__ = renderer_timeout
+
+        with TemporaryDirectory() as directory, patch.object(
+            counsel_site,
+            "_collect_once",
+            side_effect=[first_failure, "https://courts.example/case/382194"],
+        ) as collect_once:
+            destination = Path(directory) / "LDC_SMD_382194counsel.html"
+            result = counsel_site.collect("382194", destination)
+
+        self.assertEqual(result, "https://courts.example/case/382194")
+        self.assertEqual(collect_once.call_count, 2)
+        self.assertEqual(
+            collect_once.call_args_list[0].args,
+            ("382194", destination),
+        )
+        self.assertEqual(
+            collect_once.call_args_list[1].args,
+            ("382194", destination),
+        )
+        orders_site.close.assert_called_once_with()
+        orders_site.start.assert_called_once_with()
+        logger.warning.assert_called_once()
+
+    def test_non_browser_counsel_error_is_not_retried(self):
+        orders_site = Mock()
+        counsel_site = MichiganCounselSite(Settings(), Mock(), orders_site)
+
+        with TemporaryDirectory() as directory, patch.object(
+            counsel_site,
+            "_collect_once",
+            side_effect=CounselCollectionError("No public case detail was returned"),
+        ) as collect_once:
+            destination = Path(directory) / "LDC_SMD_382194counsel.html"
+            with self.assertRaisesRegex(
+                CounselCollectionError,
+                "No public case detail",
+            ):
+                counsel_site.collect("382194", destination)
+
+        collect_once.assert_called_once_with("382194", destination)
+        orders_site.close.assert_not_called()
+        orders_site.start.assert_not_called()
 
     def test_advanced_search_uses_visible_button_without_generated_uid(self):
         orders_site = Mock()

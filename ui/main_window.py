@@ -713,6 +713,14 @@ def friendly_status(line: str) -> str | None:
         return f"Collecting counsel files  •  {progress}  •  {filename}"
     if message.startswith("Counsel phase complete:"):
         return "Counsel-file collection complete."
+    if message.startswith("Building consolidated release folder:"):
+        return "Combining collected orders and counsels…"
+    if message.startswith("Publishing consolidated release folder to:"):
+        return "Copying the release folder to the shared MIAP00 location…"
+    if message.startswith("Shared release folder ready:"):
+        return "Shared release folder is ready."
+    if message.startswith("Shared release copy skipped for safety:"):
+        return "Shared copy skipped because the run contains errors."
     if message.startswith("Run complete:"):
         return "Collection complete."
     if message.startswith("Run stopped:"):

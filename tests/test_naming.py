@@ -15,6 +15,8 @@ from core.naming import (
     extract_document_date,
     extract_miap00_date_from_text,
     extract_pdf_text,
+    extract_primary_docket,
+    extract_primary_docket_from_text,
     extract_source_docket,
     normalize_final_key,
     verify_tesseract,
@@ -120,6 +122,36 @@ class NamingTests(unittest.TestCase):
     def test_invalid_source_name_is_rejected(self):
         with self.assertRaises(NamingError):
             extract_source_docket("order.pdf")
+
+    def test_pdf_header_docket_wins_over_later_consolidation_reference(self):
+        text = """Court of Appeals, State of Michigan
+ORDER
+MICHIGAN FARM BUREAU V DEPT OF ENVIRONMENT GREAT LAKES AND ENERGY
+Docket No. 381409
+LC No. 25-006752-AA
+The application for leave to appeal is GRANTED.
+This case is CONSOLIDATED with the application filed in Docket No. 381408.
+"""
+
+        self.assertEqual(extract_primary_docket_from_text(text), "381409")
+        logger = Mock()
+        with patch("core.naming.extract_pdf_text", return_value=text):
+            self.assertEqual(
+                extract_primary_docket(
+                    Path("381408_14_01.pdf"),
+                    "381408",
+                    logger=logger,
+                ),
+                "381409",
+            )
+        self.assertIn("381408 -> 381409", logger.warning.call_args.args[0])
+
+    def test_primary_docket_falls_back_when_pdf_header_is_unavailable(self):
+        with patch("core.naming.extract_pdf_text", return_value=""):
+            self.assertEqual(
+                extract_primary_docket(Path("381408_14_01.pdf"), "381408"),
+                "381408",
+            )
 
     def test_fileflex_suffix_sequence(self):
         expected = {0: "", 1: "a", 2: "b", 26: "z", 27: "aa", 28: "ab", 52: "az", 53: "ba"}

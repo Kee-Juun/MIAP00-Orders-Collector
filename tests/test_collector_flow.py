@@ -267,7 +267,12 @@ class CollectorFlowTests(unittest.TestCase):
                 handler.close()
                 collector.logger.removeHandler(handler)
 
-    def _run_one(self, duplicate_records, document_date="08142026"):
+    def _run_one(
+        self,
+        duplicate_records,
+        document_date="08142026",
+        primary_docket="381603",
+    ):
         settings = Settings(
             output_root="synthetic-output",
             start_date="2026-08-07",
@@ -297,7 +302,7 @@ class CollectorFlowTests(unittest.TestCase):
         )
         irt = Mock()
 
-        expected = f"LDC_SMD_381603_{document_date}.pdf"
+        expected = f"LDC_SMD_{primary_docket}_{document_date}.pdf"
         existing = {expected.lower(): duplicate_records} if duplicate_records else {}
 
         def preflight(start_date, end_date):
@@ -326,7 +331,12 @@ class CollectorFlowTests(unittest.TestCase):
             "core.collector.IRTDuplicateChecker", return_value=irt
         ), patch(
             "core.collector.extract_document_date", return_value=document_date
+        ), patch(
+            "core.collector.extract_primary_docket", return_value=primary_docket
         ), patch("core.collector.ReportWriter.write"), patch(
+            "core.collector.build_consolidated_release_folder",
+            return_value=None,
+        ), patch(
             "core.collector.create_logger", return_value=(logger, Path("log"))
         ), patch("pathlib.Path.mkdir"), patch(
             "pathlib.Path.exists", return_value=False
@@ -339,6 +349,16 @@ class CollectorFlowTests(unittest.TestCase):
             run_dir = collector.run()
         location_check.assert_called_once_with(timeout_seconds=8)
         return run_dir, irt, events, unlink
+
+    def test_pdf_header_docket_controls_filename_and_irt_comparison(self):
+        _run_dir, _irt, events, _unlink = self._run_one(
+            [],
+            primary_docket="381409",
+        )
+        expected_end = max(date.today(), date(2026, 8, 14)).isoformat()
+        self.assertIn("rename:LDC_SMD_381409_08142026.pdf", events)
+        self.assertIn("irt-compare:LDC_SMD_381409_08142026.pdf", events)
+        self.assertIn(f"irt-load:2026-07-07:{expected_end}", events)
 
     def test_all_downloads_are_renamed_before_one_bulk_irt_check(self):
         _run_dir, irt, events, _unlink = self._run_one([])

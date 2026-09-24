@@ -10,7 +10,7 @@ from urllib.parse import quote, urljoin
 
 import requests
 
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -31,6 +31,7 @@ class CounselCollectionError(RuntimeError):
 class MichiganCounselSite:
     """Reuse the Michigan Orders browser to collect one counsel page per docket."""
 
+    BROWSER_ATTEMPTS = 2
     CASE_DETAIL_ATTEMPTS = 3
     CASE_DETAIL_RETRY_DELAY_SECONDS = 1.0
 
@@ -52,13 +53,45 @@ class MichiganCounselSite:
     def collect(self, docket: str, destination: Path, cancel_event=None) -> str:
         self.cancel_event = cancel_event
         self.orders_site.cancel_event = cancel_event
+        for attempt in range(1, self.BROWSER_ATTEMPTS + 1):
+            try:
+                return self._collect_once(docket, destination)
+            except CollectionCancelled:
+                raise
+            except Exception as exc:
+                destination.unlink(missing_ok=True)
+                if (
+                    attempt >= self.BROWSER_ATTEMPTS
+                    or not self._retryable_browser_error(exc)
+                ):
+                    raise
+                self.logger.warning(
+                    "Counsel browser attempt %d/%d failed for %s (%s); "
+                    "restarting Chrome and retrying the same docket",
+                    attempt,
+                    self.BROWSER_ATTEMPTS,
+                    docket,
+                    exc,
+                )
+                raise_if_cancelled(
+                    cancel_event,
+                    f"Collection stopped before retrying counsel docket {docket}",
+                )
+                self.orders_site.close()
+                self.orders_site.cancel_event = cancel_event
+                self.orders_site.start()
+        raise CounselCollectionError(
+            f"Counsel browser recovery was exhausted for docket {docket}"
+        )
+
+    def _collect_once(self, docket: str, destination: Path) -> str:
         self.orders_site.start()
-        raise_if_cancelled(cancel_event, "Collection stopped before counsel lookup")
+        raise_if_cancelled(self.cancel_event, "Collection stopped before counsel lookup")
         self.logger.info("Opening Michigan case search for counsel docket %s", docket)
         cancellable_navigate(
             self.driver,
             self.settings.source_url,
-            cancel_event,
+            self.cancel_event,
             context=f"Collection stopped while opening counsel search for {docket}",
         )
         self._open_advanced_search()
@@ -106,7 +139,7 @@ class MichiganCounselSite:
             cancellable_navigate(
                 self.driver,
                 case_url,
-                cancel_event,
+                self.cancel_event,
                 context=f"Collection stopped while opening counsel case {docket}",
             )
             try:
@@ -144,6 +177,19 @@ class MichiganCounselSite:
         destination.write_text(html, encoding="utf-8", newline="\n")
         self.logger.info("Counsel collected: %s", destination.name)
         return case_url
+
+    @staticmethod
+    def _retryable_browser_error(exc: BaseException) -> bool:
+        """Recognize Selenium failures hidden under a counsel-friendly error."""
+
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, WebDriverException):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     def _load_case_detail_data(
         self,

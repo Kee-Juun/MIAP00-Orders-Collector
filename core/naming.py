@@ -32,6 +32,10 @@ _FINAL_NAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _EVENT_REFERENCE_PLACEHOLDER_PATTERN = re.compile(r"SEE EVENT \d+\.?$")
+_PRIMARY_DOCKET_PATTERN = re.compile(
+    r"\bDocket\s+Nos?\.?\s*[:#]?\s*(?P<docket>\d{5,7})\b",
+    re.IGNORECASE,
+)
 
 
 class NamingError(ValueError):
@@ -51,6 +55,49 @@ def extract_source_docket(filename: str) -> str:
     if not match:
         raise NamingError(f"Source filename does not match FileFlex MIAP00 rules: {filename}")
     return (match.group(2) or match.group(3) or "").strip()
+
+
+def extract_primary_docket(
+    pdf_path: Path,
+    fallback_docket: str,
+    *,
+    logger=None,
+    cancel_event=None,
+) -> str:
+    """Return the appellate docket printed in the PDF's formal header.
+
+    Michigan occasionally publishes a document beneath another consolidated
+    case's download URL. The source filename then carries the related docket,
+    while the order header still identifies the document's true primary
+    docket. Only the first formal ``Docket No.`` marker is eligible; docket
+    numbers mentioned later in consolidation language remain related cases.
+    """
+
+    raise_if_cancelled(cancel_event, "Collection stopped before reading a PDF docket")
+    text = extract_pdf_text(
+        pdf_path,
+        max_pages=1,
+        logger=logger,
+        cancel_event=cancel_event,
+    )
+    primary = extract_primary_docket_from_text(text)
+    if not primary:
+        return fallback_docket
+    if fallback_docket and primary != fallback_docket:
+        _log(
+            logger,
+            "warning",
+            "PDF header docket overrides source filename docket for "
+            f"{pdf_path.name}: {fallback_docket} -> {primary}",
+        )
+    return primary
+
+
+def extract_primary_docket_from_text(text: str) -> str:
+    """Read the first formal appellate docket marker from extracted PDF text."""
+
+    match = _PRIMARY_DOCKET_PATTERN.search(text[:8000])
+    return match.group("docket") if match else ""
 
 
 def docket_suffix(occurrence: int) -> str:
