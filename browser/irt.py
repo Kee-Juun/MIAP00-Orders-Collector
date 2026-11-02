@@ -332,7 +332,56 @@ class IRTDuplicateChecker:
         start_date: date,
         end_date: date,
     ) -> list[dict[str, Any]]:
-        """Return every matching counsel inventory row for one appellate docket."""
+        """Return counsel rows, retrying a stalled query in fresh Chrome."""
+
+        attempts = max(1, int(self.settings.irt_retry_attempts))
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            raise_if_cancelled(self.cancel_event)
+            self.logger.info(
+                "IRT counsel search attempt %d/%d for docket %s",
+                attempt,
+                attempts,
+                docket,
+            )
+            try:
+                return self._find_existing_counsel_once(
+                    docket,
+                    start_date,
+                    end_date,
+                )
+            except CollectionCancelled:
+                raise
+            except (IRTError, WebDriverException, ChromeStartupError) as exc:
+                last_error = exc
+                self.logger.warning(
+                    "IRT counsel search attempt %d/%d for docket %s failed: %s",
+                    attempt,
+                    attempts,
+                    docket,
+                    exc,
+                )
+                if attempt < attempts:
+                    self._restart_browser(
+                        f"retrying counsel duplicate search for docket {docket}"
+                    )
+                    cancellable_wait(
+                        self.cancel_event,
+                        2,
+                        "Collection stopped while retrying the IRT counsel search",
+                    )
+        raise IRTError(
+            f"IRT counsel duplicate search for docket {docket} failed after "
+            f"{attempts} fresh-Chrome attempt(s): {last_error}"
+        ) from last_error
+
+    def _find_existing_counsel_once(
+        self,
+        docket: str,
+        start_date: date,
+        end_date: date,
+    ) -> list[dict[str, Any]]:
+        """Run one counsel inventory search in the current browser session."""
 
         raise_if_cancelled(self.cancel_event)
         self.initialize()
@@ -348,7 +397,13 @@ class IRTDuplicateChecker:
             docket,
             pattern,
         )
-        self._search()
+        # Counsel filename searches are narrow and normally finish in seconds.
+        # Do not let one broken Ajax request consume the much longer timeout
+        # reserved for loading the 1,000+ row complete inventory snapshot.
+        self._search(
+            timeout_seconds=self.settings.irt_timeout_seconds,
+            overlay_timeout_seconds=self.settings.irt_timeout_seconds,
+        )
         records = self._capture_current_results(
             context=f"counsel duplicate search for docket {docket}"
         )
@@ -438,7 +493,12 @@ class IRTDuplicateChecker:
                 f"IRT date field {element_id} did not retain {value!r}; found {actual!r}"
             )
 
-    def _search(self, *, timeout_seconds: float | None = None) -> None:
+    def _search(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        overlay_timeout_seconds: float | None = None,
+    ) -> None:
         raise_if_cancelled(self.cancel_event)
         search_token = self._arm_search_observer()
         button = self.driver.find_element(By.ID, self.SEARCH_ID)
@@ -516,7 +576,11 @@ class IRTDuplicateChecker:
             normal_timeout = timeout_seconds or self.settings.irt_timeout_seconds
             effective_timeout = max(
                 normal_timeout,
-                self.settings.irt_overlay_timeout_seconds,
+                (
+                    self.settings.irt_overlay_timeout_seconds
+                    if overlay_timeout_seconds is None
+                    else overlay_timeout_seconds
+                ),
             )
             self._wait(
                 effective_timeout,

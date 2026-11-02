@@ -341,7 +341,10 @@ class IRTResilienceTests(unittest.TestCase):
                 "380275", date(2024, 8, 17), date(2026, 8, 17)
             )
 
-        search.assert_called_once_with()
+        search.assert_called_once_with(
+            timeout_seconds=self.checker.settings.irt_timeout_seconds,
+            overlay_timeout_seconds=self.checker.settings.irt_timeout_seconds,
+        )
         self.assertEqual(
             set_field.call_args_list,
             [
@@ -353,6 +356,56 @@ class IRTResilienceTests(unittest.TestCase):
             ],
         )
         self.assertEqual(matches, [first])
+
+    def test_counsel_lookup_restarts_browser_and_retries_same_docket(self):
+        expected = [
+            {"File Name": "LDC_SMD_381418counsel.html", "LNI": "latest"}
+        ]
+        with patch.object(
+            self.checker,
+            "_find_existing_counsel_once",
+            side_effect=[IRTError("stalled request"), expected],
+        ) as find_once, patch.object(
+            self.checker, "_restart_browser"
+        ) as restart, patch(
+            "browser.irt.cancellable_wait"
+        ) as wait:
+            result = self.checker.find_existing_counsel(
+                "381418", date(2024, 10, 2), date(2026, 10, 2)
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(find_once.call_count, 2)
+        restart.assert_called_once_with(
+            "retrying counsel duplicate search for docket 381418"
+        )
+        wait.assert_called_once_with(
+            self.checker.cancel_event,
+            2,
+            "Collection stopped while retrying the IRT counsel search",
+        )
+
+    def test_counsel_lookup_fails_closed_after_all_fresh_browser_attempts(self):
+        self.checker.settings.irt_retry_attempts = 3
+        with patch.object(
+            self.checker,
+            "_find_existing_counsel_once",
+            side_effect=IRTError("stalled request"),
+        ) as find_once, patch.object(
+            self.checker, "_restart_browser"
+        ) as restart, patch(
+            "browser.irt.cancellable_wait"
+        ):
+            with self.assertRaisesRegex(
+                IRTError,
+                "docket 381418 failed after 3 fresh-Chrome attempt",
+            ):
+                self.checker.find_existing_counsel(
+                    "381418", date(2024, 10, 2), date(2026, 10, 2)
+                )
+
+        self.assertEqual(find_once.call_count, 3)
+        self.assertEqual(restart.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()

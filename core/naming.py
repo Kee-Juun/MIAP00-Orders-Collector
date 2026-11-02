@@ -148,26 +148,7 @@ def extract_document_date(
         logger=logger,
         cancel_event=cancel_event,
     )
-    if _looks_like_event_reference_placeholder(text):
-        raise NonOrderDocumentError(
-            "Michigan Orders search returned an event-reference placeholder, "
-            f"not a certified court order: {pdf_path.name}"
-        )
-    if _looks_like_consolidated_cases_policy(text):
-        raise NonOrderDocumentError(
-            "Michigan Orders search returned the Clerk's Office consolidated-cases "
-            f"policy handout, not a certified court order: {pdf_path.name}"
-        )
-    if _looks_like_non_order_clerk_correspondence(text):
-        raise NonOrderDocumentError(
-            f"Michigan Orders search returned clerk correspondence, not a "
-            f"certified court order: {pdf_path.name}"
-        )
-    if _looks_like_received_party_filing(text):
-        raise NonOrderDocumentError(
-            f"Michigan Orders search returned a received party filing, not a "
-            f"certified court order: {pdf_path.name}"
-        )
+    _raise_if_non_order_document(text, pdf_path)
     publication_date = _extract_publication_date(text, ("FOR PUBLICATION",))
     if publication_date:
         _validate_expected_date(
@@ -229,6 +210,12 @@ def extract_document_date(
             logger=logger,
             cancel_event=cancel_event,
         )
+        # Some Michigan PDFs deliberately expose an unusable/obfuscated text
+        # layer. Full-page OCR can still identify an informational attachment
+        # or filing that the initial embedded-text check could not recognize.
+        # Reclassify that OCR result before a missing certification date is
+        # reported as a processing error.
+        _raise_if_non_order_document(ocr_text, pdf_path)
         date_value = _extract_order_date(ocr_text)
         has_certified_footer_date = bool(date_value)
     if not date_value:
@@ -256,6 +243,31 @@ def extract_miap00_date_from_text(text: str) -> str:
         return ""
     publication_date = _extract_publication_date(text, ("FOR PUBLICATION",))
     return publication_date or _extract_order_date(text)
+
+
+def _raise_if_non_order_document(text: str, pdf_path: Path) -> None:
+    """Raise the appropriate exclusion when readable text is not an order."""
+
+    if _looks_like_event_reference_placeholder(text):
+        raise NonOrderDocumentError(
+            "Michigan Orders search returned an event-reference placeholder, "
+            f"not a certified court order: {pdf_path.name}"
+        )
+    if _looks_like_consolidated_cases_policy(text):
+        raise NonOrderDocumentError(
+            "Michigan Orders search returned the Clerk's Office consolidated-cases "
+            f"policy handout, not a certified court order: {pdf_path.name}"
+        )
+    if _looks_like_non_order_clerk_correspondence(text):
+        raise NonOrderDocumentError(
+            f"Michigan Orders search returned clerk correspondence, not a "
+            f"certified court order: {pdf_path.name}"
+        )
+    if _looks_like_received_party_filing(text):
+        raise NonOrderDocumentError(
+            f"Michigan Orders search returned a received party filing, not a "
+            f"certified court order: {pdf_path.name}"
+        )
 
 
 def _looks_like_non_order_clerk_correspondence(text: str) -> bool:

@@ -350,6 +350,34 @@ This case is CONSOLIDATED with the application filed in Docket No. 381408.
         footer_ocr.assert_not_called()
         full_ocr.assert_not_called()
 
+    def test_obfuscated_policy_handout_is_excluded_after_full_page_ocr(self):
+        handout = (
+            "Michigan Court of Appeals\nOffice of the Clerk\n"
+            "POLICY ON CONSOLIDATED CASES\n"
+            "The enclosed order consolidates the noted appeals. This statement "
+            "explains the effect of consolidation on the appellate process.\n"
+            "FILING DEADLINES regarding transcripts, motions or briefs will not "
+            "be affected by the consolidation."
+        )
+        with patch(
+            "core.naming.extract_pdf_text",
+            return_value="/3/4/5/6/4/7/8/9/i255/11/12/13",
+        ), patch(
+            "core.naming.extract_pdf_footer_text_with_ocr",
+            return_value="",
+        ), patch(
+            "core.naming.extract_pdf_text_with_ocr",
+            return_value=handout,
+        ) as full_ocr:
+            with self.assertRaisesRegex(
+                NonOrderDocumentError, "consolidated-cases policy handout"
+            ):
+                extract_document_date(
+                    Path("378503_55_02.pdf"), expected_date="10/01/2026"
+                )
+
+        full_ocr.assert_called_once()
+
     def test_certified_order_with_consolidation_policy_reference_is_not_excluded(self):
         body = (
             "Michigan Court of Appeals\nOffice of the Clerk\nORDER\n"
